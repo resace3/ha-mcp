@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from dotenv import load_dotenv
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ha_mcp._version import get_version, is_running_in_addon
@@ -111,6 +111,63 @@ class Settings(BaseSettings):
     # restarts (bookmarks, browser localStorage). Read by run_main() in
     # stdio_settings_sidecar.py.
     sidecar_pin_port: int = Field(0, alias="HA_MCP_SIDECAR_PORT")
+
+    # Optional Local DAG Studio. Disabled and loopback-only by default.
+    enable_dag_studio: bool = Field(False, alias="ENABLE_DAG_STUDIO")
+    dag_studio_host: str = Field("127.0.0.1", alias="DAG_STUDIO_HOST")
+    dag_studio_port: int = Field(8765, ge=1, le=65535, alias="DAG_STUDIO_PORT")
+    dag_studio_base_path: str = Field("/dag-studio", alias="DAG_STUDIO_BASE_PATH")
+    dag_studio_data_dir: str = Field("", alias="DAG_STUDIO_DATA_DIR")
+    dag_studio_open_browser: bool = Field(False, alias="DAG_STUDIO_OPEN_BROWSER")
+    dag_studio_allow_remote: bool = Field(False, alias="DAG_STUDIO_ALLOW_REMOTE")
+    dag_studio_session_ttl_minutes: int = Field(
+        480, ge=1, le=10080, alias="DAG_STUDIO_SESSION_TTL_MINUTES"
+    )
+    dag_studio_max_request_bytes: int = Field(
+        1048576, ge=1024, le=10485760, alias="DAG_STUDIO_MAX_REQUEST_BYTES"
+    )
+    dag_studio_ai_provider: Literal["disabled", "openai_compatible"] = Field(
+        "disabled", alias="DAG_STUDIO_AI_PROVIDER"
+    )
+    dag_studio_ai_base_url: str = Field("", alias="DAG_STUDIO_AI_BASE_URL")
+    dag_studio_ai_model: str = Field("", alias="DAG_STUDIO_AI_MODEL")
+    dag_studio_ai_api_key: str = Field("", alias="DAG_STUDIO_AI_API_KEY")
+    dag_studio_ai_timeout_seconds: int = Field(
+        60, ge=1, le=300, alias="DAG_STUDIO_AI_TIMEOUT_SECONDS"
+    )
+    dag_studio_ai_max_retries: int = Field(
+        1, ge=0, le=5, alias="DAG_STUDIO_AI_MAX_RETRIES"
+    )
+    dag_studio_ai_send_entity_values: bool = Field(
+        False, alias="DAG_STUDIO_AI_SEND_ENTITY_VALUES"
+    )
+    dag_studio_ai_rate_limit_per_minute: int = Field(
+        10, ge=1, le=120, alias="DAG_STUDIO_AI_RATE_LIMIT_PER_MINUTE"
+    )
+
+    @model_validator(mode="after")
+    def validate_dag_studio(self) -> "Settings":
+        import ipaddress
+
+        try:
+            loopback = ipaddress.ip_address(self.dag_studio_host).is_loopback
+        except ValueError:
+            loopback = self.dag_studio_host == "localhost"
+        if not loopback and not self.dag_studio_allow_remote:
+            raise ValueError(
+                "DAG_STUDIO_ALLOW_REMOTE=true is required for non-loopback binding"
+            )
+        if (
+            not self.dag_studio_base_path.startswith("/")
+            or ".." in self.dag_studio_base_path
+        ):
+            raise ValueError("DAG_STUDIO_BASE_PATH must be a safe absolute path")
+        if (
+            self.dag_studio_ai_provider != "disabled"
+            and not self.dag_studio_ai_model.strip()
+        ):
+            raise ValueError("DAG_STUDIO_AI_MODEL is required when AI is enabled")
+        return self
 
     # Development/Debug configuration
     debug: bool = Field(False, alias="DEBUG")

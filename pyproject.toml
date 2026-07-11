@@ -58,13 +58,14 @@ hamcp-test-env = "tests.test_env_manager:main"
 ha-mcp-web = "ha_mcp.__main__:main_web"
 ha-mcp-sse = "ha_mcp.__main__:main_sse"
 ha-mcp-oauth = "ha_mcp.__main__:main_oauth"
+ha-mcp-dag-studio = "ha_mcp.dag_studio.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src", "tests" = "tests"}
 packages = { find = { where = ["src", "."], include = ["ha_mcp*", "tests"] } }
 
 [tool.setuptools.package-data]
-ha_mcp = ["py.typed", "_pypi_marker", "settings_ui/settings.html", "settings_ui/settings.js", "settings_ui/settings.css", "resources/skills-vendor/**/*"]
+ha_mcp = ["py.typed", "_pypi_marker", "settings_ui/settings.html", "settings_ui/settings.js", "settings_ui/settings.css", "dag_studio/web/static/*", "resources/skills-vendor/**/*"]
 
 [tool.mypy]
 python_version = "3.13"

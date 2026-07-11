@@ -1,3 +1,5 @@
+> **Optional:** Local DAG Studio is a loopback-first causal graph editor with deterministic structural validation and revisioned persistence. It is disabled by default; AI review is advisory. See [the guide](docs/dag-studio.md). Run `ha-mcp-dag-studio --port 8765` for offline editing.
+
 > **Breaking change (v7.3.0):** `ha_config_set_yaml` has been moved to [beta](docs/beta.md).
 
 <div align="center">
