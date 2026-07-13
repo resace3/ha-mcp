@@ -3,6 +3,19 @@
 <!-- version list -->
 
 
+## v7.12.4 (2026-07-13)
+
+### Added
+
+- Secure Local DAG Studio profile, ingress UI, confirmation-bound tools, and
+  fork-owned multi-architecture release pipeline.
+
+### Fixed
+
+- Scan each release image with Trivy using its explicit target platform before
+  publishing the combined OCI manifest.
+
+
 ## v7.12.3 (2026-07-10)
 
 ### Fixed
