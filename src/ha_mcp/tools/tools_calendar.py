@@ -15,16 +15,20 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import tool
 from pydantic import Field
 
+from ..client.rest_client import (
+    HomeAssistantCommandError,
+    HomeAssistantConnectionError,
+)
 from ..errors import ErrorCode, create_error_response
 from .auto_backup import with_auto_backup
 from .helpers import (
     exception_to_structured_error,
-    get_connected_ws_client,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
     validate_identifier_not_empty,
 )
+from .util_helpers import is_connection_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -199,35 +203,23 @@ class CalendarTools:
         if location is not None:
             event["location"] = location
 
-        ws_client, conn_error = await get_connected_ws_client(
-            self._client.base_url,
-            self._client.token,
-            verify_ssl=self._client.verify_ssl,
+        # Route through the shared pooled WebSocket (issue #1813) instead of a
+        # dedicated connect/auth handshake per call. The pooled path collapses a
+        # failed WS command into ``{"success": False, "error": ...}``; a
+        # transport-shaped failure re-raises as ``HomeAssistantConnectionError``
+        # (the classifier type-matches it to connectivity guidance), anything
+        # else as the same ``HomeAssistantCommandError`` the dedicated
+        # send_command used to raise so the caller's error handler still
+        # attaches the rrule-specific suggestions.
+        result = await self._client.send_websocket_message(
+            {"type": "calendar/event/create", "entity_id": entity_id, "event": event}
         )
-        if conn_error or ws_client is None:
-            raise_tool_error(
-                conn_error
-                or create_error_response(
-                    ErrorCode.CONNECTION_FAILED,
-                    "Failed to connect to Home Assistant WebSocket",
-                    context={"entity_id": entity_id},
-                )
-            )
-
-        try:
-            return await ws_client.send_command(
-                "calendar/event/create", entity_id=entity_id, event=event
-            )
-        finally:
-            # Guard disconnect: a transport-teardown error here would
-            # otherwise replace the original send_command exception.
-            try:
-                await ws_client.disconnect()
-            except Exception as disconnect_error:
-                logger.debug(
-                    f"WebSocket disconnect after create_event for "
-                    f"{entity_id}: {disconnect_error}"
-                )
+        if not result.get("success"):
+            error = str(result.get("error", "calendar/event/create failed"))
+            if is_connection_error_message(error):
+                raise HomeAssistantConnectionError(error)
+            raise HomeAssistantCommandError(error)
+        return result
 
     async def _create_simple_calendar_event(
         self,
@@ -257,6 +249,13 @@ class CalendarTools:
         self, entity_id: str, rrule: str | None, error: Exception
     ) -> list[str]:
         """Build suggestions for a failed ha_config_set_calendar_event call."""
+        if isinstance(error, HomeAssistantConnectionError):
+            # A transport drop is not a calendar problem — domain hints would
+            # send the agent chasing a non-issue during an HA restart.
+            return [
+                "Home Assistant may be restarting or unreachable — retry shortly",
+                "Check the connection to Home Assistant",
+            ]
         suggestions = [
             f"Verify calendar entity '{entity_id}' exists and supports event creation",
             "Check datetime format (ISO 8601)",
@@ -541,35 +540,21 @@ class CalendarTools:
             if recurrence_range:
                 ws_kwargs["recurrence_range"] = recurrence_range
 
-            ws_client, conn_error = await get_connected_ws_client(
-                self._client.base_url,
-                self._client.token,
-                verify_ssl=self._client.verify_ssl,
+            # Route through the shared pooled WebSocket (issue #1813) instead of a
+            # dedicated connect/auth handshake per call. Transport-shaped
+            # failures raise ``HomeAssistantConnectionError`` (connectivity
+            # guidance); anything else re-raises as the same
+            # ``HomeAssistantCommandError`` the dedicated send_command used to
+            # raise so the outer handler builds the delete-specific
+            # suggestions (404 / not-supported).
+            result = await self._client.send_websocket_message(
+                {"type": "calendar/event/delete", **ws_kwargs}
             )
-            if conn_error or ws_client is None:
-                raise_tool_error(
-                    conn_error
-                    or create_error_response(
-                        ErrorCode.CONNECTION_FAILED,
-                        "Failed to connect to Home Assistant WebSocket",
-                        context={"entity_id": entity_id, "uid": uid},
-                    )
-                )
-
-            try:
-                result = await ws_client.send_command(
-                    "calendar/event/delete", **ws_kwargs
-                )
-            finally:
-                # Guard disconnect: a transport-teardown error here would
-                # otherwise replace the original send_command exception.
-                try:
-                    await ws_client.disconnect()
-                except Exception as disconnect_error:
-                    logger.debug(
-                        f"WebSocket disconnect after delete_event for "
-                        f"{entity_id} uid={uid}: {disconnect_error}"
-                    )
+            if not result.get("success"):
+                error = str(result.get("error", "calendar/event/delete failed"))
+                if is_connection_error_message(error):
+                    raise HomeAssistantConnectionError(error)
+                raise HomeAssistantCommandError(error)
 
             return {
                 "success": True,
@@ -586,27 +571,40 @@ class CalendarTools:
         except Exception as error:
             logger.error(f"Failed to delete calendar event from {entity_id}: {error}")
 
-            suggestions = [
-                f"Verify calendar entity '{entity_id}' exists",
-                f"Verify event with UID '{uid}' exists in the calendar",
-                "Use ha_config_get_calendar_events() to find the correct event UID",
-                "Some calendar integrations may not support event deletion",
-            ]
-
-            error_str = str(error)
-            if "404" in error_str or "not found" in error_str.lower():
-                suggestions.insert(
-                    0, f"Calendar entity '{entity_id}' or event '{uid}' not found"
-                )
-            if "not supported" in error_str.lower():
-                suggestions.insert(0, "This calendar does not support event deletion")
-
             exception_to_structured_error(
                 error,
                 context={"entity_id": entity_id, "uid": uid},
-                suggestions=suggestions,
+                suggestions=self._build_remove_calendar_event_error_suggestions(
+                    entity_id, uid, error
+                ),
             )
             return None  # unreachable: exception_to_structured_error always raises
+
+    def _build_remove_calendar_event_error_suggestions(
+        self, entity_id: str, uid: str, error: Exception
+    ) -> list[str]:
+        """Build suggestions for a failed ha_config_remove_calendar_event call."""
+        if isinstance(error, HomeAssistantConnectionError):
+            # A transport drop is not a calendar problem — domain hints would
+            # send the agent chasing a non-issue during an HA restart.
+            return [
+                "Home Assistant may be restarting or unreachable — retry shortly",
+                "Check the connection to Home Assistant",
+            ]
+        suggestions = [
+            f"Verify calendar entity '{entity_id}' exists",
+            f"Verify event with UID '{uid}' exists in the calendar",
+            "Use ha_config_get_calendar_events() to find the correct event UID",
+            "Some calendar integrations may not support event deletion",
+        ]
+        error_str = str(error)
+        if "404" in error_str or "not found" in error_str.lower():
+            suggestions.insert(
+                0, f"Calendar entity '{entity_id}' or event '{uid}' not found"
+            )
+        if "not supported" in error_str.lower():
+            suggestions.insert(0, "This calendar does not support event deletion")
+        return suggestions
 
 
 def register_calendar_tools(mcp: Any, client: Any, **kwargs: Any) -> None:

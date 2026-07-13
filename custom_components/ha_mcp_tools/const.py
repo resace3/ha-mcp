@@ -18,12 +18,21 @@ from datetime import timedelta
 
 DOMAIN = "ha_mcp_tools"
 
+# Component version, kept in lockstep with ``manifest.json``'s ``version``.
+# ``ha_mcp_tools/info`` reports this so the server can display/debug the running
+# component build; ``TestManifestVersionParity`` pins the two together so a
+# manifest bump that forgets this constant (or vice-versa) fails in CI. The
+# capability negotiation — not this version — gates each WS command (see
+# ``websocket_api.CAPABILITIES``).
+COMPONENT_VERSION = "1.1.0"
+
 # Config-entry discriminator (``entry.data[CONF_ENTRY_TYPE]``). A missing value
 # means "tools" so the pre-existing services entry keeps working across the
 # component update with no migration.
 CONF_ENTRY_TYPE = "entry_type"
 ENTRY_TYPE_TOOLS = "tools"
 ENTRY_TYPE_SERVER = "server"
+MIN_EMBEDDED_HOME_ASSISTANT_VERSION = "2026.6.0"
 
 # Allowed directories for file operations (relative to config dir)
 ALLOWED_READ_DIRS = ["www", "themes", "custom_templates", "dashboards"]
@@ -288,6 +297,29 @@ OPT_REGENERATE_SECRETS = "regenerate_secrets"
 # server through Home Assistant; only the direct server port (+ the
 # admin-only sidebar panel, which proxies over loopback) remains.
 OPT_ENABLE_WEBHOOK = "enable_webhook"
+# Conversation-agent LLM API (#1745): when False, the toolset is not
+# registered as a Home Assistant LLM API, so it never appears in any
+# conversation agent's "Control Home Assistant" selector. On by default —
+# registering the API only makes it selectable; nothing is exposed until a
+# user picks it on an agent.
+OPT_ENABLE_LLM_API = "enable_llm_api"
+DEFAULT_ENABLE_LLM_API = True
+# Which exposure shape(s) the LLM API offers to conversation agents:
+# ``tool_search`` (default) registers a compact API — pinned tools plus
+# search/execute meta-tools — the shape context-limited models need; ``full``
+# registers the whole exposed catalog as one API; ``both`` registers the two
+# side by side so the choice is made per agent in HA's own selector.
+OPT_LLM_API_EXPOSURE = "llm_api_exposure"
+EXPOSURE_TOOL_SEARCH = "tool_search"
+EXPOSURE_FULL = "full"
+EXPOSURE_BOTH = "both"
+DEFAULT_LLM_API_EXPOSURE = EXPOSURE_TOOL_SEARCH
+# When False, the persistent notification created on every server bring-up is
+# suppressed; the connect URLs still reach the admin-only Home Assistant log.
+OPT_ENABLE_STARTUP_NOTIFICATION = "enable_startup_notification"
+# When False, the admin-only "HA-MCP" sidebar settings panel is not registered;
+# the server's options stay reachable on the entry's Configure screen.
+OPT_ENABLE_SIDEBAR_PANEL = "enable_sidebar_panel"
 
 # entry.data keys (persisted ids + secrets; entry.data is fine for secrets).
 DATA_WEBHOOK_ID = "webhook_id"
@@ -329,6 +361,9 @@ DATA_UPDATE_COORDINATOR = "update_coordinator"
 # finding on #1760). Bring-up pops it: notification on success, silent drop on
 # failure (the package/start repair issues cover that path).
 DATA_PENDING_UPDATE_NOTIFY = "pending_update_notify"
+# Unregister callback for the conversation-agent LLM API (#1745), stored by
+# the bring-up success path and invoked (idempotently) by teardown.
+DATA_LLM_API_UNSUB = "llm_api_unsub"
 
 # Webhook auth modes (mirrors the webhook-proxy add-on's default posture).
 WEBHOOK_AUTH_NONE = "none"  # secret webhook URL is the shared secret (default)
@@ -371,6 +406,15 @@ OAUTH_BASE = "/api/ha_mcp_tools/oauth"
 HACS_COMPONENT_URL = (
     "https://my.home-assistant.io/redirect/hacs_repository/"
     "?owner=homeassistant-ai&repository=ha-mcp-integration&category=integration"
+)
+
+# Usage guide for the conversation-agent LLM API option (#1745). Injected into
+# the options form as a description placeholder — hassfest forbids literal
+# URLs inside strings.json.
+LLM_API_DOCS_URL = (
+    "https://github.com/homeassistant-ai/ha-mcp/blob/master/docs/"
+    "in-process-server.md"
+    "#chat-with-the-toolset-from-home-assistant-conversation-agents--voice"
 )
 
 # Repair-issue ids surfaced when server bring-up fails.

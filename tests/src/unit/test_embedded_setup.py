@@ -112,6 +112,8 @@ def _spy(monkeypatch):
     surfacing to spies (the connect-URL tests restore the real surfacing)."""
     monkeypatch.setattr(esetup, "async_register_webhook", AsyncMock())
     monkeypatch.setattr(esetup, "async_unregister_webhook", AsyncMock())
+    monkeypatch.setattr(esetup, "async_register_llm_api", AsyncMock())
+    monkeypatch.setattr(esetup, "async_unregister_llm_api", MagicMock())
     monkeypatch.setattr(esetup.ir, "async_create_issue", MagicMock())
     monkeypatch.setattr(esetup.ir, "async_delete_issue", MagicMock())
     monkeypatch.setattr(esetup, "_surface_connect_urls", MagicMock())
@@ -129,6 +131,11 @@ class TestBringUp:
         esetup._surface_connect_urls.assert_called_once()
         assert isinstance(hass.data[DOMAIN][DATA_MANAGER], fake_manager)
         esetup.ir.async_create_issue.assert_not_called()
+        # Conversation-agent LLM API (#1745): registered with the running
+        # server's port + secret path.
+        kwargs = esetup.async_register_llm_api.await_args.kwargs
+        assert kwargs["port"] == 9584
+        assert kwargs["secret_path"] == "/private_x"
 
     async def test_success_clears_stale_repair_issues(self, fake_manager):
         # Review gap: a successful bring-up must clear EVERY repair-issue id
@@ -185,6 +192,23 @@ class TestBringUp:
         assert kwargs["secret_path"] == "/private_secret"
         assert kwargs["register_endpoint"] is True
 
+    async def test_llm_api_option_off_skips_registration(self, fake_manager, caplog):
+        # The Conversation-agent LLM API toggle (#1745, default on): turning
+        # it off must skip the registration while the server itself, the
+        # webhook, and the rest of the bring-up run unchanged.
+        import logging
+
+        hass = _make_hass()
+        entry = _make_entry(options={esetup.OPT_ENABLE_LLM_API: False})
+
+        with caplog.at_level(logging.INFO):
+            await esetup.async_bring_up_server(hass, entry)
+
+        fake_manager.async_start.assert_awaited_once()
+        esetup.async_register_webhook.assert_awaited_once()
+        esetup.async_register_llm_api.assert_not_awaited()
+        assert "LLM API disabled by option" in caplog.text
+
     async def test_package_failure_files_package_issue_and_skips_webhook(
         self, fake_manager
     ):
@@ -199,6 +223,7 @@ class TestBringUp:
         fake_manager.async_stop.assert_awaited_once()  # teardown ran
         assert DATA_MANAGER not in hass.data.get(DOMAIN, {})
         esetup.async_register_webhook.assert_not_awaited()
+        esetup.async_register_llm_api.assert_not_awaited()
         # The failure kind selects the package-install repair issue.
         assert esetup.ir.async_create_issue.call_args.args[2] == ISSUE_PACKAGE_FAILED
 
@@ -273,6 +298,7 @@ class TestTeardown:
         await esetup.async_teardown_server(hass)
 
         esetup.async_unregister_webhook.assert_awaited()
+        esetup.async_unregister_llm_api.assert_called()
         fake_manager.async_stop.assert_awaited_once()
         assert DATA_MANAGER not in hass.data.get(DOMAIN, {})
         # A reload must keep the provisioned token.
@@ -493,6 +519,83 @@ class TestSurfaceConnectUrls:
         with caplog.at_level(logging.INFO):
             esetup._surface_connect_urls(hass, entry, "none")
         assert "http://192.168.1.5:8123/api/webhook/mcp_id" in caplog.text
+
+    def test_default_options_create_notification_with_panel_line(
+        self, monkeypatch, caplog
+    ):
+        # Baseline for the two UX toggles: with neither option stored, the
+        # start-up notification is created (async_create) and its message links
+        # the sidebar settings panel; nothing is dismissed.
+        import logging
+
+        dismiss = MagicMock()
+        monkeypatch.setattr(esetup.persistent_notification, "async_dismiss", dismiss)
+        _install_network_cloud(cloud_url=None, local_url="http://192.168.1.5:8123")
+        hass = _make_hass()
+        entry = _make_entry(data={DATA_WEBHOOK_ID: "mcp_id", DATA_SECRET_PATH: "/priv"})
+        with caplog.at_level(logging.INFO):
+            esetup._surface_connect_urls(hass, entry, "none")
+        self.notif.assert_called_once()
+        assert "[HA-MCP settings panel](/ha-mcp)" in self._message()
+        dismiss.assert_not_called()
+
+    def test_startup_notification_off_dismisses_and_skips_create(
+        self, monkeypatch, caplog
+    ):
+        # enable_startup_notification=False: no persistent notification is
+        # created; instead any stale one is dismissed by its id. The connect
+        # URLs still reach the admin-only INFO log unchanged.
+        import logging
+
+        dismiss = MagicMock()
+        monkeypatch.setattr(esetup.persistent_notification, "async_dismiss", dismiss)
+        _install_network_cloud(cloud_url=None, local_url="http://192.168.1.5:8123")
+        hass = _make_hass()
+        entry = _make_entry(
+            data={DATA_WEBHOOK_ID: "mcp_id", DATA_SECRET_PATH: "/priv"},
+            options={esetup.OPT_ENABLE_STARTUP_NOTIFICATION: False},
+        )
+        with caplog.at_level(logging.INFO):
+            esetup._surface_connect_urls(hass, entry, "none")
+        # No notification created.
+        self.notif.assert_not_called()
+        # The stale one is dismissed by the connect notification's id.
+        dismiss.assert_called_once()
+        dismissed_id = dismiss.call_args.kwargs.get("notification_id") or (
+            dismiss.call_args.args[1] if len(dismiss.call_args.args) > 1 else None
+        )
+        assert dismissed_id == esetup._NOTIFICATION_ID == "ha_mcp_tools_server_connect"
+        assert dismiss.call_args.args[0] is hass
+        # The INFO connect-URL log still happens.
+        assert "HA-MCP in-process server is running" in caplog.text
+        assert "http://192.168.1.5:8123/api/webhook/mcp_id" in caplog.text
+
+    def test_sidebar_panel_off_omits_panel_line_from_notification(
+        self, monkeypatch, caplog
+    ):
+        # enable_sidebar_panel=False (start-up notification still on): the
+        # notification is created, but its message drops the sidebar panel line
+        # (there is no panel to link to). The rest of the notification stays.
+        import logging
+
+        dismiss = MagicMock()
+        monkeypatch.setattr(esetup.persistent_notification, "async_dismiss", dismiss)
+        _install_network_cloud(cloud_url=None, local_url="http://192.168.1.5:8123")
+        hass = _make_hass()
+        entry = _make_entry(
+            data={DATA_WEBHOOK_ID: "mcp_id", DATA_SECRET_PATH: "/priv"},
+            options={esetup.OPT_ENABLE_SIDEBAR_PANEL: False},
+        )
+        with caplog.at_level(logging.INFO):
+            esetup._surface_connect_urls(hass, entry, "none")
+        self.notif.assert_called_once()
+        dismiss.assert_not_called()
+        message = self._message()
+        assert "[HA-MCP settings panel](/ha-mcp)" not in message
+        assert "(/ha-mcp)" not in message
+        # Still a real notification: the admin-only Configure pointer remains.
+        assert "Configure" in message
+        assert self.notif.call_args.kwargs.get("title") == "HA-MCP Server"
 
 
 class TestBuildConnectUrls:

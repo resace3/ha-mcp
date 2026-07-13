@@ -26,6 +26,13 @@ let toolStates = {};
 // Populated from data.env_pinned in loadTools(); read by render() to
 // lock rows and show the env-var name banner.
 let toolEnvPinned = {};
+// Conversation-agent LLM API exposure (#1745). toolLlm mirrors the
+// server-computed EFFECTIVE value per tool (user override, else the
+// deny-by-default for beta/dev/restart tools); toolLlmOverrides holds
+// only the user-set overrides and is what saveConfig persists — tools
+// never flipped keep tracking their defaults across releases.
+let toolLlm = {};
+let toolLlmOverrides = {};
 let saveTimer = null;
 let openGroups = new Set();
 
@@ -160,6 +167,8 @@ async function loadTools() {
   toolData = data.tools || [];
   toolStates = data.states || {};
   toolEnvPinned = data.env_pinned || {};
+  toolLlm = data.llm_api || {};
+  toolLlmOverrides = data.llm_api_overrides || {};
   READ_ONLY_EXEMPT = new Set(data.read_only_exempt || []);
   // Load policy state before the first render so the "security gated"
   // toggle reflects current policy.rules. loadPolicyState() never throws
@@ -741,6 +750,14 @@ function render() {
               `<span class="slider"></span></label>` +
             `<span>security gated</span>` +
           `</div>` +
+          `<div class="toggle-group ${isEnabled ? '' : 'disabled-toggle'}" ` +
+               `title="Offer this tool to Home Assistant conversation agents through the LLM API. Applies on the agent's next message - no restart. A tool disabled above is unavailable to agents regardless.">` +
+            `<label class="switch"><input type="checkbox" name="tool:${escapeHtml(t.name)}:llm" data-tool="${escapeHtml(t.name)}" data-field="llm" ` +
+              `aria-label="${escapeHtml(title)} exposed to the conversation-agent LLM API" ` +
+              `${(toolLlm[t.name] !== false) ? 'checked' : ''} ${isEnabled ? '' : 'disabled'}>` +
+              `<span class="slider"></span></label>` +
+            `<span>LLM API</span>` +
+          `</div>` +
         `</div>`;
 
       const inputs = div.querySelectorAll('input[type="checkbox"]');
@@ -763,6 +780,16 @@ function render() {
               e.target.checked = wasGated;
               alert('Failed to update tool security policy: ' + err.message);
             }
+            render();
+            return;
+          }
+          if (field === 'llm') {
+            // LLM-API exposure lives in its own overrides map (persisted
+            // alongside states by saveConfig); the effective map mirrors it
+            // immediately so the re-render shows the new value.
+            toolLlm[t.name] = e.target.checked;
+            toolLlmOverrides[t.name] = e.target.checked;
+            scheduleSave();
             render();
             return;
           }
@@ -816,7 +843,7 @@ async function saveConfig() {
     resp = await fetch('./api/settings/tools', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({states: toolStates}),
+      body: JSON.stringify({states: toolStates, llm_api: toolLlmOverrides}),
     });
   } catch (e) {
     // Auto-save is fire-and-forget (scheduleSave -> setTimeout); without
@@ -826,8 +853,20 @@ async function saveConfig() {
     return;
   }
   if (resp.ok) {
-    updateStatus('Saved. Restart required.', true);
-    markRestartRequired();
+    // LLM-API-exposure-only saves apply live (stamped per tools/list);
+    // enable/disable/pin changes still need a restart. The server tells
+    // us which happened.
+    let restartRequired = true;
+    try {
+      const saved = await resp.json();
+      restartRequired = saved.restart_required !== false;
+    } catch (e) { /* keep the conservative default */ }
+    if (restartRequired) {
+      updateStatus('Saved. Restart required.', true);
+      markRestartRequired();
+    } else {
+      updateStatus('Saved. LLM API exposure applies on the next agent message.', true);
+    }
   } else {
     // Surface the server's structured error when present (mirrors
     // saveAdvancedSettings / saveFeatureFlag) instead of a generic
@@ -1516,6 +1555,10 @@ const FEATURE_META = {
     label: "Attach best-practice skills on writes",
     help: "Master switch for the write-tool skill content delivery feature (issue #1182). When enabled (default), the six config write tools (automations, scripts, scenes, helpers, dashboards, raw YAML) attach the canonical Home Assistant best-practice reference files under skill_content on every successful write, plus auto-embed any reference sections cited by best-practice warnings. Each tool also exposes a per-call MandatoryBPS parameter the agent can set to false on subsequent calls once it has the content. When this master switch is off, NO skill_content goes out regardless of the per-call parameter or BP warnings. Leave on if your LLM benefits from inline guidance; turn off to minimise tokens when using an LLM that has the best-practice files indexed via skills or another retrieval path. Requires restart to take effect.",
   },
+  enable_strict_mandatory_bps: {
+    label: "Strict best-practices mode",
+    help: "Strict mode: prevents the client from using the tool until it can prove that it read the best practices. While on, the six best-practice write tools (automations, scripts, scenes, helpers, dashboards, raw YAML) are blocked and return an error directing the client to read the best-practices skill via ha_get_skill_guide and pass back the acknowledgment key it obtains there. Nested under \"Attach best-practice skills on writes\" above and inert while that parent toggle is off. Requires restart to take effect (applies live in standalone HTTP mode).",
+  },
   // Master beta toggle — gates the 5 sub-flags below at runtime
   // (see config.py:_apply_feature_flag_overrides master gate). UI
   // dims sub-rows when this is off and re-renders live on flip.
@@ -1553,7 +1596,7 @@ const FEATURE_META = {
   },
   enable_code_mode: {
     label: "Enable code-mode sandbox (beta)",
-    help: "Beta feature, disabled by default. Enables ha_manage_custom_tool, a sandboxed Python interpreter (pydantic-monty) that lets AI assistants write/run/save/delete custom tools when no built-in tool covers the request. Sandbox cannot touch the filesystem or arbitrary network, but CAN call any registered MCP tool, hit the HA REST API, or send HA WebSocket commands, effectively 'do whatever existing tools allow you to do, in any combination'. See docs/beta.md for known limitations. Requires restart to take effect.",
+    help: "Beta feature, disabled by default. Enables ha_manage_custom_tool, a sandboxed Python interpreter (pydantic-monty) that lets AI assistants write/run/save/delete custom tools when no built-in tool covers the request. Sandbox cannot touch the filesystem or arbitrary network, but CAN call any registered MCP tool, hit the HA REST API, or send HA WebSocket commands, effectively 'do whatever existing tools allow you to do, in any combination'. Saved tools persist and are visible to any client that can connect to ha-mcp. See docs/beta.md for known limitations. Requires restart to take effect.",
   },
   enable_lite_docstrings: {
     label: "Enable lite tool docstrings (beta)",
@@ -1574,7 +1617,7 @@ let BETA_SUB_FLAGS = new Set();
 // Sub-flags of ``enable_yaml_config_editing`` (confirm-flow toggle +
 // per-key packages gates). They ARE in BETA_SUB_FLAGS (it mirrors
 // config.BETA_FEATURE_FIELDS verbatim), but the main render pass skips
-// them via the includes() guard below, and renderYamlPackagesSubRows
+// them via the includes() guard below, and renderSubFlagRows
 // re-renders them nested beneath their parent — so they never appear
 // as standalone beta-sub rows.
 const YAML_PACKAGES_SUB_FLAGS = [
@@ -1582,6 +1625,16 @@ const YAML_PACKAGES_SUB_FLAGS = [
   'enable_yaml_packages_automation',
   'enable_yaml_packages_script',
   'enable_yaml_packages_scene',
+];
+
+// Sub-flag of ``enable_mandatory_bps`` (strict best-practices mode).
+// Unlike YAML_PACKAGES_SUB_FLAGS this is NON-beta — it is NOT in
+// BETA_SUB_FLAGS and its only gate is the parent toggle. The main
+// render pass skips it via the includes() guard below, and
+// renderSubFlagRows re-renders it nested beneath its parent so
+// it never appears as a standalone top-level row.
+const MANDATORY_BPS_SUB_FLAGS = [
+  'enable_strict_mandatory_bps',
 ];
 
 // Cached add-on flag. Each settings endpoint (/api/settings/features,
@@ -1694,9 +1747,12 @@ function renderFeatureFlags(flags) {
     const f = flags[fieldName];
     if (!f) return;
     // Skip yaml-packages sub-rows in the main pass — they're rendered
-    // by renderYamlPackagesSubRows below right after their parent so
+    // by renderSubFlagRows below right after their parent so
     // the nesting reads in source order.
     if (YAML_PACKAGES_SUB_FLAGS.includes(fieldName)) return;
+    // Same for the strict-mode sub-row — rendered by
+    // renderSubFlagRows right after its enable_mandatory_bps parent.
+    if (MANDATORY_BPS_SUB_FLAGS.includes(fieldName)) return;
     const meta = FEATURE_META[fieldName];
     const isMaster = fieldName === 'enable_beta_features';
     const isBetaSub = BETA_SUB_FLAGS.has(fieldName);
@@ -1781,6 +1837,18 @@ function renderFeatureFlags(flags) {
             renderFeatureFlags(_lastFeatureFlags);
           }
         }
+        // Re-render on enable_mandatory_bps flip so the strict-mode
+        // sub-row dims/undims immediately. Same live-cache pattern as
+        // the master and yaml-config flips above.
+        if (fieldName === 'enable_mandatory_bps') {
+          if (_lastFeatureFlags[fieldName]) {
+            _lastFeatureFlags[fieldName] = {
+              ..._lastFeatureFlags[fieldName],
+              value: input.checked,
+            };
+            renderFeatureFlags(_lastFeatureFlags);
+          }
+        }
         saveFeatureFlag(fieldName, input.checked);
       });
       const slider = document.createElement('span');
@@ -1825,7 +1893,20 @@ function renderFeatureFlags(flags) {
     // itself is off.
     if (fieldName === 'enable_yaml_config_editing') {
       const parentOn = !!f.value;
-      renderYamlPackagesSubRows(flags, targetBody, masterOn, parentOn);
+      renderSubFlagRows(flags, targetBody, YAML_PACKAGES_SUB_FLAGS, {
+        cssClass: 'yaml-packages-sub',
+        lockedByGate: !masterOn || !parentOn,
+      });
+    }
+    // After the enable_mandatory_bps parent row, inject its strict-mode
+    // sub-row. This whole group is non-beta, so the only gate is the
+    // parent toggle (no master beta involved).
+    if (fieldName === 'enable_mandatory_bps') {
+      const parentOn = !!f.value;
+      renderSubFlagRows(flags, targetBody, MANDATORY_BPS_SUB_FLAGS, {
+        cssClass: 'mandatory-bps-sub',
+        lockedByGate: !parentOn,
+      });
     }
     // After the enable_filesystem_tools row, inject the custom-directories
     // editor (issue #1567). Dimmed when either the master beta is off or
@@ -1838,14 +1919,23 @@ function renderFeatureFlags(flags) {
   });
 }
 
-function renderYamlPackagesSubRows(flags, parentEl, masterOn, parentOn) {
-  YAML_PACKAGES_SUB_FLAGS.forEach(fieldName => {
+// Shared renderer for bool sub-flag rows nested under a parent toggle
+// (yaml-packages under enable_yaml_config_editing, strict mode under
+// enable_mandatory_bps). Each row is a checkbox+slider whose change
+// handler syncs _lastFeatureFlags and POSTs via saveFeatureFlag, dimmed
+// + input-disabled when ``lockedByGate`` is true. Callers precompute
+// lockedByGate from whatever gates apply to their group (yaml-packages:
+// master beta AND parent; mandatory-bps: parent only) and pass the CSS
+// class that carries the group's indent/guide-bar depth. The number/text
+// code-mode sub-numerics are NOT rendered here — they save through
+// commitAdvancedEdit and live in renderCodeModeSubRows.
+function renderSubFlagRows(flags, parentEl, subFieldNames, { cssClass, lockedByGate }) {
+  subFieldNames.forEach(fieldName => {
     const f = flags[fieldName];
     if (!f) return;
     const meta = FEATURE_META[fieldName] || { label: fieldName, help: '' };
-    const lockedByGate = !masterOn || !parentOn;
     const row = document.createElement('div');
-    row.className = 'feature-row yaml-packages-sub' + (lockedByGate ? ' dimmed' : '');
+    row.className = 'feature-row ' + cssClass + (lockedByGate ? ' dimmed' : '');
 
     const info = document.createElement('div');
     info.className = 'feature-info';
@@ -1861,7 +1951,7 @@ function renderYamlPackagesSubRows(flags, parentEl, masterOn, parentOn) {
         `${escapeHtml(ORIGIN_INFO_NOTE[f.origin])}</div>`
       : '';
     info.innerHTML =
-      `<div class="feature-name">${escapeHtml(meta.label)}</div>` +
+      `<div class="feature-name" id="label-feature-${fieldName}">${escapeHtml(meta.label)}</div>` +
       `<div class="feature-help">${escapeHtml(meta.help)}</div>` +
       lockedNote + infoNote;
 
@@ -1874,6 +1964,7 @@ function renderYamlPackagesSubRows(flags, parentEl, masterOn, parentOn) {
     input.name = 'feature:' + fieldName;
     input.checked = !!f.value;
     input.disabled = !f.editable || lockedByGate;
+    input.setAttribute('aria-labelledby', 'label-feature-' + fieldName);
     input.addEventListener('change', () => {
       // Keep the cached flag value in sync (parity with the parent/master
       // row handlers) so a later parent flip — which re-renders from
@@ -1941,7 +2032,7 @@ function renderCodeModeSubRows(parentEl, masterOn, codeModeOn) {
         `<div class="feature-locked-note">${envLockedNoteHtml(f.env_var, f.field)}</div>`;
     }
     info.innerHTML =
-      `<div class="feature-name">${escapeHtml(meta.label)}</div>` +
+      `<div class="feature-name" id="label-feature-${f.field}">${escapeHtml(meta.label)}</div>` +
       `<div class="feature-help">${escapeHtml(meta.help)}</div>` +
       lockedNote;
 
@@ -1964,6 +2055,7 @@ function renderCodeModeSubRows(parentEl, masterOn, codeModeOn) {
     inputEl.disabled = disabled;
     inputEl.dataset.advField = f.field;
     inputEl.name = 'adv:' + f.field;
+    inputEl.setAttribute('aria-labelledby', 'label-feature-' + f.field);
     inputEl.addEventListener('change', () => {
       let v;
       if (f.type === 'int') v = parseInt(inputEl.value, 10);
@@ -2946,6 +3038,8 @@ const ADVANCED_FIELD_META = {
   automation_config_time_budget: { label: "Automation config time budget (s)", help: "Max seconds ha_search/ha_deep_search spends fetching automation configs before returning a partial result. Raise on instances with many automations. Range 1–600. Restart required." },
   script_config_time_budget:     { label: "Script config time budget (s)",     help: "Max seconds ha_search/ha_deep_search spends fetching script configs before returning a partial result. Range 1–600. Restart required." },
   scene_config_time_budget:      { label: "Scene config time budget (s)",      help: "Max seconds ha_search/ha_deep_search spends fetching scene configs before returning a partial result. Range 1–600. Restart required." },
+  individual_config_timeout:     { label: "Per-request config fetch timeout (s)", help: "Timeout for each individual automation/script/scene config fetch during deep search. On HA servers that serve config reads serially, raise this and/or lower the batch size so queued requests don't time out. Values above the HA request timeout (HA_TIMEOUT, default 30) have no extra effect — the HTTP client gives up first. Range 1–600. Restart required." },
+  individual_fetch_batch_size:   { label: "Config fetch batch size",          help: "How many per-id config fetches deep search issues concurrently. Lower toward 1 on HA servers that serve config reads serially (symptom: 'timed out' partial-result warnings). Range 1–100. Restart required." },
   backup_hint:         { label: "Backup-hint level",           help: "Tunes how strongly the LLM is prompted to take a full-HA snapshot before risky writes." },
   dashboard_screenshot_engine_url: { label: "Dashboard screenshot engine URL", help: "Base URL of the screenshot engine (e.g. http://puppet:10000). Leave blank to auto-discover the Puppet App (add-on) via the Supervisor (HA OS / Supervised). Only used when the Dashboard Screenshot beta feature is enabled. Takes effect without a restart." },
   enable_websocket:    { label: "Enable WebSocket",            help: "WebSocket-based state monitoring. Disabling falls back to polling; many tools degrade. Restart required." },
@@ -2985,6 +3079,9 @@ const ADVANCED_RESTART_REQUIRED = new Set([
   // it is resolved live per capture, so it takes effect immediately.
   "automation_config_time_budget", "script_config_time_budget",
   "scene_config_time_budget",
+  // The Attempt-C per-request timeout and batch size (#1784) share the
+  // budgets' import-time consumption, so they need a restart too.
+  "individual_config_timeout", "individual_fetch_batch_size",
   "code_mode_max_duration", "code_mode_max_memory",
   "code_mode_max_recursion", "code_mode_max_invocations",
   "code_mode_saved_tools_path",

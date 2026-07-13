@@ -415,6 +415,10 @@
         "MandatoryBPS": {
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
+        },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
         }
       }
     },
@@ -820,6 +824,10 @@
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
         },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
+        },
         "return_screenshot": {
           "type": "Annotated[bool, Field(description=\"After writing, also return a rendered PNG of the dashboard so you can see what it looks like in a single call (the dashboard creation/iteration loop). Requires the 'dashboard screenshot' beta feature + engine add-on/sidecar; if unavailable, the write result is returned with a warning.\")]",
           "default": false
@@ -1104,16 +1112,26 @@
   {
     "name": "ha_get_entity",
     "title": "Get Entity",
-    "description": "Get entity registry information for one or more entities.\n\nReturns detailed entity registry metadata including area assignment,\ncustom name/icon, enabled/hidden state, aliases, labels, and more.\n\nRELATED TOOLS:\n- ha_set_entity(): Modify entity properties (area, name, icon, enabled, hidden, aliases)\n- ha_get_state(): Get current state/attributes (on/off, temperature, etc.)\n- ha_search(): Find entities by name, domain, or area\n\nEXAMPLES:\n- Single entity: ha_get_entity(\"sensor.temperature\")\n- Multiple entities: ha_get_entity([\"light.living_room\", \"switch.porch\"])\n\nRESPONSE FIELDS:\n- entity_id: Full entity identifier\n- name: Custom display name (null if using original_name)\n- original_name: Default name from integration\n- icon: Custom icon (null if using default)\n- area_id: Assigned area/room ID (null if unassigned)\n- disabled_by: Why disabled (null=enabled, \"user\"/\"integration\"/etc)\n- hidden_by: Why hidden (null=visible, \"user\"/\"integration\"/etc)\n- enabled: Boolean shorthand (True if disabled_by is null)\n- hidden: Boolean shorthand (True if hidden_by is not null)\n- aliases: Voice assistant aliases\n- labels: Assigned label IDs\n- categories: Category assignments (dict mapping scope to category_id)\n- device_class: User \"Show As\" override (null = use original_device_class)\n- original_device_class: Default device class from the integration\n- options: Per-domain registry options (e.g. sensor display_precision).\n  Voice-assistant exposure is also stored here but should be set/cleared\n  via the ha_set_entity(expose_to=...) parameter, not the options dict.\n- platform: Integration platform (e.g., \"hue\", \"zwave_js\")\n- device_id: Associated device ID (null if standalone)\n- config_entry_id: Parent config entry's ID (null for YAML-only\n  entities). When non-null — e.g. for UI-created template/group/\n  utility_meter/derivative/... helpers — pass it to\n  ``ha_get_integration(entry_id=..., include_options=True)`` to read the\n  helper's current config (template body, group members, etc.) without\n  scanning a domain list.\n- unique_id: Integration's unique identifier",
+    "description": "Get entity registry information for one or more entities.\n\nReturns detailed entity registry metadata including area assignment,\ncustom name/icon, enabled/hidden state, aliases, labels, and more.\n\nRESOLVER MODE:\nPass unique_id (instead of entity_id) to resolve a stable integration\nunique_id to its entity_id(s). Since the registry's unique key is\n(domain, platform, unique_id), the same unique_id can match multiple\nplatforms — all matches are returned in entity_entries with a `matches`\ncount. Narrow with domain/platform. Resolver reads as_partial_dict, so\naliases and the device_class override come back as defaults ([]/null).\n\nRELATED TOOLS:\n- ha_set_entity(): Modify entity properties (area, name, icon, enabled, hidden, aliases)\n- ha_get_state(): Get current state/attributes (on/off, temperature, etc.)\n- ha_search(): Find entities by name, domain, or area\n\nEXAMPLES:\n- Single entity: ha_get_entity(\"sensor.temperature\")\n- Multiple entities: ha_get_entity([\"light.living_room\", \"switch.porch\"])\n\nRESPONSE FIELDS:\n- entity_id: Full entity identifier\n- name: Custom display name (null if using original_name)\n- original_name: Default name from integration\n- icon: Custom icon (null if using default)\n- area_id: Assigned area/room ID (null if unassigned)\n- disabled_by: Why disabled (null=enabled, \"user\"/\"integration\"/etc)\n- hidden_by: Why hidden (null=visible, \"user\"/\"integration\"/etc)\n- enabled: Boolean shorthand (True if disabled_by is null)\n- hidden: Boolean shorthand (True if hidden_by is not null)\n- aliases: Voice assistant aliases\n- labels: Assigned label IDs\n- categories: Category assignments (dict mapping scope to category_id)\n- device_class: User \"Show As\" override (null = use original_device_class)\n- original_device_class: Default device class from the integration\n- options: Per-domain registry options (e.g. sensor display_precision).\n  Voice-assistant exposure is also stored here but should be set/cleared\n  via the ha_set_entity(expose_to=...) parameter, not the options dict.\n- platform: Integration platform (e.g., \"hue\", \"zwave_js\")\n- device_id: Associated device ID (null if standalone)\n- config_entry_id: Parent config entry's ID (null for YAML-only\n  entities). When non-null — e.g. for UI-created template/group/\n  utility_meter/derivative/... helpers — pass it to\n  ``ha_get_integration(entry_id=..., include_options=True)`` to read the\n  helper's current config (template body, group members, etc.) without\n  scanning a domain list.\n- unique_id: Integration's unique identifier",
     "inputSchema": {
       "properties": {
         "entity_id": {
-          "type": "Annotated[str | list[str], JSON_STRING_COERCION, Field(description=\"Entity ID or list of entity IDs to retrieve (e.g., 'sensor.temperature' or ['light.living_room', 'switch.porch'])\")]"
+          "type": "Annotated[str | list[str] | None, JSON_STRING_COERCION, Field(description=\"Entity ID or list of entity IDs to retrieve (e.g., 'sensor.temperature' or ['light.living_room', 'switch.porch']). Mutually exclusive with unique_id.\", default=None)]",
+          "default": null
+        },
+        "unique_id": {
+          "type": "Annotated[str | None, Field(description='Resolve a stable integration unique_id to its entity_id(s) (entity_id is mutable, unique_id is not). Mutually exclusive with entity_id. Optionally narrow with domain/platform.', default=None)]",
+          "default": null
+        },
+        "domain": {
+          "type": "Annotated[str | None, Field(description=\"Resolver filter (unique_id mode only): restrict matches to this entity domain, e.g. 'sensor'.\", default=None)]",
+          "default": null
+        },
+        "platform": {
+          "type": "Annotated[str | None, Field(description=\"Resolver filter (unique_id mode only): restrict matches to this integration platform, e.g. 'hue'.\", default=None)]",
+          "default": null
         }
-      },
-      "required": [
-        "entity_id"
-      ]
+      }
     },
     "annotations": {
       "readOnlyHint": true,
@@ -1152,11 +1170,11 @@
   {
     "name": "ha_remove_entity",
     "title": "Remove Entity",
-    "description": "Remove an entity from the Home Assistant entity registry.\n\nPermanently removes the entity registration from Home Assistant.\nThe entity will no longer appear in the UI or be available to automations.\n\nWARNING: This permanently removes the entity registration.\n- Use only for orphaned or stale entity entries\n- If the underlying device or integration is still active, the entity\n  may be re-added automatically on the next HA restart or reload\n- This action cannot be undone without restoring from backup\n\nEXAMPLES:\n- Remove orphaned sensor: ha_remove_entity(\"sensor.old_temperature\")\n- Remove stale helper entry: ha_remove_entity(\"input_boolean.deleted_helper\")\n\nNOTE: For most use cases, consider disabling instead:\nha_set_entity(entity_id=\"sensor.old\", enabled=False)\n\nRELATED TOOLS:\n- ha_search: Find entities to verify the entity_id before removing\n- ha_get_entity: Check entity details before removal",
+    "description": "Remove one or more entities from the Home Assistant entity registry.\n\nPermanently removes the entity registration from Home Assistant.\nThe entity will no longer appear in the UI or be available to automations.\n\nWARNING: This permanently removes the entity registration.\n- Use only for orphaned or stale entity entries\n- If the underlying device or integration is still active, the entity\n  may be re-added automatically on the next HA restart or reload\n- This action cannot be undone without restoring from backup\n\nBULK MODE:\nPass a list of entity IDs to remove up to 100 at once — handy for\nclearing the restored=true orphans an integration leaves behind after\nits filters change. Removals run sequentially and return:\n  {removed: [...], skipped: [...], errors: [{entity_id, code, message}]}\nwhere skipped = ids already absent (not-found is idempotent, not an\nerror). Bulk mode is NOT auto-backed-up (the snapshot is single-entity);\nsingle-id removal still is.\n\nEXAMPLES:\n- Remove orphaned sensor: ha_remove_entity(\"sensor.old_temperature\")\n- Remove stale helper entry: ha_remove_entity(\"input_boolean.deleted_helper\")\n- Bulk cleanup: ha_remove_entity([\"sensor.orphan_1\", \"sensor.orphan_2\"])\n\nNOTE: For most use cases, consider disabling instead:\nha_set_entity(entity_id=\"sensor.old\", enabled=False)\n\nRELATED TOOLS:\n- ha_search: Find entities to verify the entity_id before removing\n- ha_get_entity: Check entity details before removal",
     "inputSchema": {
       "properties": {
         "entity_id": {
-          "type": "Annotated[str, Field(description=\"Entity ID to remove from the entity registry (e.g., 'sensor.old_temperature'). This permanently removes the entity registration.\")]"
+          "type": "Annotated[str | list[str], JSON_STRING_COERCION, Field(description=\"Entity ID, or a list of entity IDs, to remove from the entity registry (e.g., 'sensor.old_temperature'). Permanently removes the registration(s).\")]"
         }
       },
       "required": [
@@ -1546,11 +1564,11 @@
   {
     "name": "ha_config_list_helpers",
     "title": "List Helpers",
-    "description": "List all Home Assistant helpers of a specific type with their configurations.\n\nReturns complete configuration for all helpers of the specified type including:\n- ID, name, icon\n- Type-specific settings (min/max for input_number, options for input_select, etc.)\n- Area and label assignments\n\nSUPPORTED HELPER TYPES:\n- input_button: Virtual buttons for triggering automations\n- input_boolean: Toggle switches/checkboxes\n- input_select: Dropdown selection lists\n- input_number: Numeric sliders/input boxes\n- input_text: Text input fields\n- input_datetime: Date/time pickers\n- counter: Counters with increment/decrement/reset\n- timer: Countdown timers with start/pause/cancel\n- schedule: Weekly schedules with time ranges (on/off per day)\n- zone: Geographical zones for presence detection\n- person: Person entities linked to device trackers\n- tag: NFC/QR tags for automation triggers\n\nEXAMPLES:\n- List all number helpers: ha_config_list_helpers(\"input_number\")\n- List all counters: ha_config_list_helpers(\"counter\")\n- List all zones: ha_config_list_helpers(\"zone\")\n- List all persons: ha_config_list_helpers(\"person\")\n- List all tags: ha_config_list_helpers(\"tag\")\n\n**NOTE:** This only returns storage-based helpers (created via UI/API), not YAML-defined helpers.\n\nFlow-based types (template / group / utility_meter / derivative / etc.)\ncannot be listed via this tool — use ``ha_search`` for those.\n\nFor detailed helper documentation, use ha_get_skill_guide.",
+    "description": "List all Home Assistant helpers of a specific type with their configurations.\n\nReturns complete configuration for all helpers of the specified type including:\n- id (immutable storage key), entity_id (current — address the helper by\n  this, where available), name (current display name), original_name\n  (creation-time name), icon\n- Type-specific settings (min/max for input_number, options for input_select, etc.)\n- Area and label assignments\n\nFor a helper renamed in the UI, id/original_name keep the storage values while\nentity_id/name reflect the current entity registry (entity_id is the identifier\nha_config_set_helper resolves against, so prefer it over id for a renamed helper).\nentity_id/original_name are present only for storage-collection helpers matched in\nthe entity registry — types with no backing entity (e.g. tag), and every record when\nthe registry read degrades, carry only id/name (a warning flags the degraded case).\n\nSUPPORTED HELPER TYPES:\n- input_button: Virtual buttons for triggering automations\n- input_boolean: Toggle switches/checkboxes\n- input_select: Dropdown selection lists\n- input_number: Numeric sliders/input boxes\n- input_text: Text input fields\n- input_datetime: Date/time pickers\n- counter: Counters with increment/decrement/reset\n- timer: Countdown timers with start/pause/cancel\n- schedule: Weekly schedules with time ranges (on/off per day)\n- zone: Geographical zones for presence detection\n- person: Person entities linked to device trackers\n- tag: NFC/QR tags for automation triggers\n\nEXAMPLES:\n- List all number helpers: ha_config_list_helpers(\"input_number\")\n- List all counters: ha_config_list_helpers(\"counter\")\n- List all zones: ha_config_list_helpers(\"zone\")\n- List all persons: ha_config_list_helpers(\"person\")\n- List all tags: ha_config_list_helpers(\"tag\")\n- List every helper type at once: ha_config_list_helpers(\"all\")\n\n**NOTE:** This only returns storage-based helpers (created via UI/API), not YAML-defined helpers.\n\nFlow-based types (template / group / utility_meter / derivative / etc.)\nrequire the ha_mcp_tools custom component (>= 1.1.0) and are served only\nthrough it; storage types are listed on all installs. Requesting a flow\ntype without the component returns a COMPONENT_NOT_INSTALLED error.\n\nPass helper_type=\"all\" to enumerate every helper type in a single call.\nEach record carries its own ``helper_type``. This mode is component-only\n(there is no single built-in command that lists all types): without the\nha_mcp_tools component it returns a COMPONENT_NOT_INSTALLED error rather\nthan a partial or empty list.\n\nFor detailed helper documentation, use ha_get_skill_guide.",
     "inputSchema": {
       "properties": {
         "helper_type": {
-          "type": "Annotated[Literal['input_button', 'input_boolean', 'input_select', 'input_number', 'input_text', 'input_datetime', 'counter', 'timer', 'schedule', 'zone', 'person', 'tag'], Field(description='Type of helper entity to list')]"
+          "type": "Annotated[Literal['input_button', 'input_boolean', 'input_select', 'input_number', 'input_text', 'input_datetime', 'counter', 'timer', 'schedule', 'zone', 'person', 'tag', 'all'] | SUPPORTED_HELPERS, Field(description=\"Helper type to list. Storage types are listed on all installs; flow-based types require the ha_mcp_tools custom component. Pass 'all' to list every helper type in one call (also requires the ha_mcp_tools component).\")]"
         }
       },
       "required": [
@@ -1738,6 +1756,10 @@
         "MandatoryBPS": {
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
+        },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
         }
       },
       "required": [
@@ -2131,22 +2153,28 @@
     "source_file": "tools_system.py"
   },
   {
-    "name": "ha_set_integration_enabled",
-    "title": "Set Integration Enabled",
-    "description": "Enable/disable integration (config entry).\n\nUse ha_get_integration() to find entry IDs.",
+    "name": "ha_set_integration",
+    "title": "Set Integration",
+    "description": "Manage an integration (config entry): enable/disable, add, or update options.\n\nModes (pick one):\n- Enable/disable: entry_id + enabled.\n- Add integration: domain (+ config) — drives the domain's config\n  flow, including menus and multi-step forms.\n- Update options: entry_id + config — drives the entry's options\n  flow (what the \"Configure\" button does in the HA UI).\n\nWHEN NOT TO USE:\n- Helpers (template, group, utility_meter, ...): use\n  ha_config_set_helper.\n- Config subentries: use\n  ha_config_set_helper(helper_type='config_subentry').\n- Removing an entry: use ha_remove_helpers_integrations.\n\nUse ha_get_integration() to find entry IDs, and\nha_get_integration(entry_id=..., include_schema=True) to inspect the\noptions fields before an update.\n\nCaveats: adding an integration runs its config flow exactly as the HA\nUI would (may pair devices, scan the network, create entities). Flows\nrequiring a browser step (OAuth) or an asynchronous provider step\nerror out at that step with a structured error instead of completing.\n\nEXAMPLES:\n- Disable: ha_set_integration(entry_id=\"abc123\", enabled=False)\n- Add: ha_set_integration(domain=\"workday\", config={\"name\": \"Workday\"})\n- Update options: ha_set_integration(entry_id=\"abc123\", config={\"scan_interval\": 30})",
     "inputSchema": {
       "properties": {
         "entry_id": {
-          "type": "Annotated[str, Field(description='Config entry ID')]"
+          "type": "Annotated[str | None, Field(description=\"Config entry ID of an existing integration (enable/disable and options-update modes). Omit when adding via 'domain'.\", default=None)]",
+          "default": null
         },
         "enabled": {
-          "type": "Annotated[bool, Field(description='True to enable, False to disable')]"
+          "type": "Annotated[bool | None, Field(description=\"True to enable, False to disable the entry. Requires entry_id; mutually exclusive with 'domain' and 'config'.\", default=None)]",
+          "default": null
+        },
+        "domain": {
+          "type": "Annotated[str | None, Field(description=\"Integration domain to add (e.g. 'workday', 'local_calendar') — starts and drives that domain's config flow. Pass the flow's form fields in 'config'.\", default=None)]",
+          "default": null
+        },
+        "config": {
+          "type": "Annotated[dict[str, Any] | None, JSON_STRING_COERCION, Field(description=\"Flow form data. With 'domain': input for the new integration's config flow. With 'entry_id' alone: input for the entry's options flow (updates its options). Multi-step flows consume keys per step; menu steps take 'next_step_id'. The step's data_schema is returned on validation errors so field names can be corrected.\", default=None)]",
+          "default": null
         }
-      },
-      "required": [
-        "entry_id",
-        "enabled"
-      ]
+      }
     },
     "annotations": {
       "destructiveHint": true
@@ -2455,6 +2483,10 @@
         "MandatoryBPS": {
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
+        },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
         }
       },
       "required": [
@@ -2551,6 +2583,10 @@
         "MandatoryBPS": {
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
+        },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
         }
       },
       "required": [
@@ -2656,7 +2692,7 @@
   {
     "name": "ha_search",
     "title": "Search",
-    "description": "Search for entities (lights, sensors, switches, climate, etc.) by name, domain, or area — AND inside automation/script/scene/helper/dashboard configurations — in one call.\n\nSearches two surfaces in parallel and returns tagged results:\n  - **entities**: matches from the entity registry (entity_id,\n    friendly name, area). Use `domain_filter` and/or `area_filter` to\n    list/narrow. Omit `query` to enumerate entities by domain/area.\n  - **automations / scripts / scenes / helpers / dashboards**: matches\n    *inside* configuration definitions — triggers, actions, sequences,\n    scene entity-sets, helper bodies, dashboard cards. Use `query`\n    with config-body terms; filter with `search_types`.\n\nEligibility:\n  - Registry (entity) search runs whenever `query`, `domain_filter`,\n    or `area_filter` is set, except when `search_types` is explicitly\n    set (which pins to config-only).\n  - Config-body search runs only when `query` is non-empty AND the\n    caller's inputs do not signal entity-only intent — i.e. when\n    none of `domain_filter`/`area_filter`/`state_filter` is set, OR\n    when `search_types` is explicitly set as an override. The\n    \"filter set ⇒ skip body\" rule keeps name-based single-entity\n    lookups (e.g. `ha_search(\"bedroom motion\", domain_filter=\n    \"binary_sensor\")`) off the expensive config-body backend; pass\n    `search_types=[...]` to opt back in (a warning surfaces in the\n    response when the gate fires so the skip is visible).\n\nUse this whenever you need to find something in HA — without needing\nto decide between entity-name search vs config-body search up front.\n\nWhen NOT to use:\n  - To fetch the state of a known entity_id: use `ha_get_state` (cheaper,\n    no search overhead).\n  - To inspect a specific automation/script/scene config by id: use the\n    matching `ha_config_get_*` tool.\n  - To list installed add-ons: use `ha_get_addon`.\n\nCaveats:\n  - Both surfaces fan out in parallel; response carries `partial: True`\n    plus an `errors[]` array tagged by surface (\"entities\" / \"configs\")\n    when one branch raises. Empty `entities`/`automations`/... combined\n    with `partial: True` means \"search failed\", not \"no results\".\n  - `partial: True` is ALSO set (with `partial_reason`) when the\n    config-body branch loses data on the per-type fetch paths —\n    either the per-id wall-clock budget exhausts and skips\n    unfetched configs, OR individual fetches raise exceptions\n    (caught at debug-level so they would otherwise be silent), OR\n    an `input_*` helper-type list fetch fails. Helpers run on every\n    default call, so silent per-type-list failures would otherwise\n    leave callers unable to tell a real zero-match from a partial\n    backend outage.\n  - When `partial: True` is set, the `partial_reason` text is\n    also mirrored into `warnings[]` with an `\"incomplete results: \"`\n    prefix. Agents that read `warnings` consistently (the\n    entity-intent skip warning lands fine) but ignore `partial`\n    still see the truncation diagnostic this way.\n  - When the body branch is skipped by the entity-intent gate above,\n    the response carries a `warnings[]` entry naming the skip\n    reason; pass `search_types=[...]` to override.\n  - The `fields=` parameter projects the response to only the\n    named top-level keys; diagnostic / pagination keys\n    (`success`, `warnings`, `errors`, `partial`, `partial_reason`,\n    `*_total_matches`, `has_more`, `next_offset`, and per-surface\n    counterparts) are always retained so projection cannot hide\n    incomplete-results state. Distinct from `result_fields=`\n    which projects each entity record's fields.\n  - `count` is items in this response (post-pagination), not total\n    matches across the corpus. Use `entity_total_matches` +\n    `config_total_matches` for the totals.\n  - `limit`/`offset` are applied per-surface independently. The flat\n    `has_more` / `next_offset` keys describe the next caller-page\n    (same offset/limit semantics as a single-surface tool — iterate\n    with `offset = next_offset`). Per-surface\n    `entity_has_more`/`entity_next_offset` and\n    `config_has_more`/`config_next_offset` let callers see which\n    surface still has results when only one of two does.\n\nExamples:\n    - List sensors in an area: ha_search(domain_filter=\"sensor\", area_filter=\"Living Room\")\n    - List all calendars: ha_search(domain_filter=\"calendar\")\n    - Find a light by name: ha_search(\"kitchen\", domain_filter=\"light\")\n    - Which automations use an entity (no filter, body included): ha_search(\"light.bed_light\")\n    - Scenes touching a light: ha_search(\"light.kitchen\", search_types=[\"scene\"])\n    - Narrow the response to only the entity bucket: ha_search(\"kitchen\", fields=[\"entities\"])",
+    "description": "Search for entities (lights, sensors, switches, climate, etc.) by name, domain, or area — AND inside automation/script/scene/helper/dashboard configurations — in one call.\n\nTwo surfaces run in parallel and return tagged results:\n  - **entities**: entity-registry matches (entity_id, friendly name,\n    area). Filter with `domain_filter`/`area_filter`; omit `query` to\n    enumerate a domain/area.\n  - **automations / scripts / scenes / helpers / dashboards**: matches\n    *inside* config definitions — triggers, actions, sequences, scene\n    entity-sets, helper bodies, dashboard cards. Driven by `query`;\n    narrow with `search_types`.\n\nUse this whenever you need to find something in HA without deciding\nentity-name vs config-body search up front.\n\nWhen NOT to use:\n  - To read a known entity_id's state: use `ha_get_state` (cheaper).\n  - To inspect one automation/script/scene config by id: use the\n    matching `ha_config_get_*`.\n  - To list installed add-ons: use `ha_get_addon`.\n\nConfig-body search is skipped when `domain_filter`/`area_filter`/\n`state_filter` signal entity-only intent (keeping name lookups off the\nexpensive backend); a `warnings[]` entry names the skip. Pass\n`search_types=[...]` to force config search.\n\nCaveats:\n  - `partial: True` means results are NOT exhaustive — a surface raised,\n    or the config-body branch lost data (per-id time budget exhausted,\n    an individual fetch failed, or a helper-type list fetch failed).\n    Empty buckets with `partial: True` mean \"search failed\", not \"no\n    results\". The cause is in `partial_reason`, also mirrored into\n    `warnings[]` with an \"incomplete results: \" prefix. Do not treat a\n    partial response as complete.\n  - `count` is items in this response (post-pagination), not corpus\n    totals — use `entity_total_matches` + `config_total_matches`.\n  - `limit`/`offset` apply per-surface. Flat `has_more`/`next_offset`\n    page the next call (iterate `offset = next_offset`); per-surface\n    `entity_*`/`config_*` variants show which surface still has results.\n\nFor parameters, schema, and worked examples, see ha_get_skill_guide.\n\nExamples:\n    - List sensors in an area: ha_search(domain_filter=\"sensor\", area_filter=\"Living Room\")\n    - Find a light by name: ha_search(\"kitchen\", domain_filter=\"light\")\n    - Which automations use an entity: ha_search(\"light.bed_light\")\n    - Scenes touching a light: ha_search(\"light.kitchen\", search_types=[\"scene\"])\n    - Narrow the response to the entity bucket: ha_search(\"kitchen\", fields=[\"entities\"])",
     "inputSchema": {
       "properties": {
         "query": {
@@ -2712,7 +2748,7 @@
           "default": null
         },
         "fields": {
-          "type": "Annotated[str | list[str] | None, JSON_STRING_COERCION, Field(default=None, description='Project the response to only the specified top-level keys (e.g. [\"entities\", \"automations\"]). Diagnostic / pagination keys are always retained regardless of projection, so narrowing the response shape cannot hide partial / error state. None = full response. Distinct from `result_fields` (which projects each entity record\\'s fields). Available keys: success, query, entities, automations, scripts, scenes, helpers, dashboards, search_types, search_type, entity_total_matches, config_total_matches, count, offset, limit, has_more, next_offset, entity_has_more, entity_next_offset, config_has_more, config_next_offset, by_domain, state_filter_note, area_names, domain_filter, area_filter, message, warnings, errors, partial, partial_reason.')]",
+          "type": "Annotated[str | list[str] | None, JSON_STRING_COERCION, Field(default=None, description='Project the response to the named top-level keys (e.g. [\"entities\", \"automations\"]); None = full response. Diagnostic / pagination keys are always retained so projection cannot hide partial / error state. Distinct from `result_fields` (which projects each entity record\\'s keys). Available keys: success, query, entities, automations, scripts, scenes, helpers, dashboards, search_types, search_type, entity_total_matches, config_total_matches, count, offset, limit, has_more, next_offset, entity_has_more, entity_next_offset, config_has_more, config_next_offset, by_domain, state_filter_note, area_names, domain_filter, area_filter, message, warnings, errors, partial, partial_reason.')]",
           "default": null
         },
         "config_time_budget": {
@@ -2935,6 +2971,10 @@
         "MandatoryBPS": {
           "type": "Annotated[bool, Field(default=True)]",
           "default": true
+        },
+        "BestPracticeKey": {
+          "type": "BestPracticeKeyParam",
+          "default": null
         }
       },
       "required": [
@@ -3125,12 +3165,16 @@
   {
     "name": "ha_reload_core",
     "title": "Reload Core Components",
-    "description": "Reload Home Assistant configuration without full restart.\n\nThis tool reloads specific configuration components, allowing changes\nto take effect without restarting the entire Home Assistant instance.\nThis is much faster than a full restart.\n\n**Parameters:**\n- target: What to reload. Options:\n  - \"all\": Reload all reloadable components\n  - \"automations\": Reload automation configurations\n  - \"scripts\": Reload script configurations\n  - \"scenes\": Reload scene configurations\n  - \"groups\": Reload group configurations\n  - \"input_booleans\": Reload input_boolean helpers\n  - \"input_numbers\": Reload input_number helpers\n  - \"input_texts\": Reload input_text helpers\n  - \"input_selects\": Reload input_select helpers\n  - \"input_datetimes\": Reload input_datetime helpers\n  - \"input_buttons\": Reload input_button helpers\n  - \"timers\": Reload timer helpers\n  - \"templates\": Reload template sensors/entities\n  - \"persons\": Reload person configurations\n  - \"zones\": Reload zone configurations\n  - \"core\": Reload core configuration (customize, packages)\n  - \"themes\": Reload frontend themes\n\n**Example Usage:**\n```python\n# Reload just automations after editing\nha_reload_core(target=\"automations\")\n\n# Reload all configurations\nha_reload_core(target=\"all\")\n\n# Reload input helpers after adding new ones\nha_reload_core(target=\"input_booleans\")\n```\n\n**When to Use:**\n- After editing automation/script YAML files\n- After adding new input helpers via YAML\n- After modifying customize.yaml\n- After theme changes",
+    "description": "Reload Home Assistant configuration without full restart.\n\nThis tool reloads specific configuration components, allowing changes\nto take effect without restarting the entire Home Assistant instance.\nThis is much faster than a full restart.\n\n**Parameters:**\n- target: What to reload. Options:\n  - \"all\": Reload all reloadable components\n  - \"automations\": Reload automation configurations\n  - \"scripts\": Reload script configurations\n  - \"scenes\": Reload scene configurations\n  - \"groups\": Reload group configurations\n  - \"input_booleans\": Reload input_boolean helpers\n  - \"input_numbers\": Reload input_number helpers\n  - \"input_texts\": Reload input_text helpers\n  - \"input_selects\": Reload input_select helpers\n  - \"input_datetimes\": Reload input_datetime helpers\n  - \"input_buttons\": Reload input_button helpers\n  - \"timers\": Reload timer helpers\n  - \"templates\": Reload template sensors/entities\n  - \"persons\": Reload person configurations\n  - \"zones\": Reload zone configurations\n  - \"core\": Reload core configuration (customize, packages)\n  - \"themes\": Reload frontend themes\n- entry_id: Reload a SINGLE config entry (one integration instance)\n  instead of sweeping subsystems — the fast path after editing a custom\n  component on disk. Pass it alone (leave `target` at its \"all\" default);\n  combining it with an explicit `target` is a validation error. Find the\n  id via ha_get_integration.\n\n**Example Usage:**\n```python\n# Reload just automations after editing\nha_reload_core(target=\"automations\")\n\n# Reload all configurations\nha_reload_core(target=\"all\")\n\n# Reload input helpers after adding new ones\nha_reload_core(target=\"input_booleans\")\n```\n\n**When to Use:**\n- After editing automation/script YAML files\n- After adding new input helpers via YAML\n- After modifying customize.yaml\n- After theme changes",
     "inputSchema": {
       "properties": {
         "target": {
           "type": "str",
           "default": "all"
+        },
+        "entry_id": {
+          "type": "str | None",
+          "default": null
         }
       }
     },
@@ -3340,7 +3384,7 @@
   {
     "name": "ha_get_zone",
     "title": "Get Zone",
-    "description": "Get zone information - list all zones or get details for a specific one.\n\nWithout a zone_id: Lists all Home Assistant zones with their coordinates and radius.\nWith a zone_id: Returns detailed configuration for a specific zone.\n\nZONE PROPERTIES:\n- ID, name, icon\n- Latitude, longitude, radius\n- Passive mode setting\n\nEXAMPLES:\n- List all zones: ha_get_zone()\n- Get specific zone: ha_get_zone(zone_id=\"abc123\")\n\n**NOTE:** This returns storage-based zones (created via UI/API), not YAML-defined zones.\nThe 'home' zone is typically defined in YAML and may not appear in this list.",
+    "description": "Get zone information - list all zones or get details for a specific one.\n\nWithout a zone_id: Lists all Home Assistant zones with their coordinates and radius.\nWith a zone_id: Returns detailed configuration for a specific zone.\n\nZONE PROPERTIES:\n- ID, name, icon\n- Latitude, longitude, radius\n- Passive mode setting\n\nEXAMPLES:\n- List all zones: ha_get_zone()\n- Get specific zone: ha_get_zone(zone_id=\"abc123\")\n\n**NOTE:** With the ha_mcp_tools custom component installed, YAML-defined\nzones — including the auto-synthesized 'home' zone — are included and\nmarked ``editable=false`` / ``source=\"yaml\"`` (storage zones created via\nUI/API are ``source=\"storage\"``). Without the component, only storage\nzones are listed and YAML-defined zones such as 'home' will not appear.",
     "inputSchema": {
       "properties": {
         "zone_id": {

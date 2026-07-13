@@ -372,6 +372,9 @@ def main() -> int:
     enable_lite_docstrings = False  # default
     lite_docstrings_in_config = False  # presence flag
     enable_mandatory_bps = True  # default (issue #1182 — on by default, non-beta)
+    # Strict best-practices mode (issue #1779). Non-beta, default-ON child
+    # of enable_mandatory_bps; runtime-gated off whenever the parent is off.
+    enable_strict_mandatory_bps = True  # default
     # Master beta toggle: present only in the dev addon's schema.
     # Default to False (stable behaviour); when
     # the dev schema-default merges in, ``beta_master_in_config``
@@ -387,6 +390,11 @@ def main() -> int:
     disabled_tools_raw = ""  # default
     pinned_tools_raw = ""  # default
     verify_ssl = True  # default
+    # Opt-in only: the distinct fork add-on schema enables this, while the
+    # shared dev add-on (which also executes this start.py) keeps the normal
+    # HA-MCP tool catalog for regression testing and development.
+    enable_dag_studio = False
+    dag_studio_max_request_bytes = 1_048_576
 
     if config_file.exists():
         try:
@@ -493,6 +501,16 @@ def main() -> int:
                     "using default True"
                 )
                 enable_mandatory_bps = True
+            raw_strict_mandatory_bps = config.get("enable_strict_mandatory_bps", True)
+            if isinstance(raw_strict_mandatory_bps, bool):
+                enable_strict_mandatory_bps = raw_strict_mandatory_bps
+            else:
+                log_error(
+                    "enable_strict_mandatory_bps must be bool, got "
+                    f"{type(raw_strict_mandatory_bps).__name__}="
+                    f"{raw_strict_mandatory_bps!r}; using default True"
+                )
+                enable_strict_mandatory_bps = True
             # Master beta toggle is present in the dev-addon schema.
             # Track presence separately so stable
             # add-on installs (where the key is absent from options.json)
@@ -526,6 +544,11 @@ def main() -> int:
             raw_pinned = config.get("pinned_tools", "")
             pinned_tools_raw = raw_pinned if isinstance(raw_pinned, str) else ""
             verify_ssl = resolve_bool_option(config, "verify_ssl", True)
+            enable_dag_studio = resolve_bool_option(config, "enable_dag_studio", False)
+            raw_dag_max = config.get("dag_studio_max_request_bytes", 1_048_576)
+            dag_studio_max_request_bytes = (
+                raw_dag_max if isinstance(raw_dag_max, int) else 1_048_576
+            )
         except Exception as e:
             log_error(f"Failed to read config: {e}, using defaults")
             # Persistent "you lost your features" line so an operator
@@ -569,10 +592,24 @@ def main() -> int:
     # READ_ONLY_MODE is non-beta and in BOTH addon schemas, so it is
     # written unconditionally (like ENABLE_MANDATORY_BPS below).
     os.environ["READ_ONLY_MODE"] = str(read_only_mode).lower()
+    os.environ["ENABLE_DAG_STUDIO"] = str(enable_dag_studio).lower()
+    os.environ["DAG_STUDIO_DATA_DIR"] = "/data/dag_studio"
+    os.environ["DAG_STUDIO_AI_PROVIDER"] = "disabled"
+    os.environ["DAG_STUDIO_MAX_REQUEST_BYTES"] = str(dag_studio_max_request_bytes)
+    # Dedicated DAG profile: no generic device, service, automation or config
+    # tools. Do not set this for the shared dev add-on profile.
+    if enable_dag_studio:
+        os.environ["ENABLED_TOOL_MODULES"] = "tools_dag"
+    else:
+        os.environ.pop("ENABLED_TOOL_MODULES", None)
     # ENABLE_MANDATORY_BPS is non-beta and default-ON, so it is written
     # unconditionally (like the stable core settings above) — never
     # presence-gated or beta-master-gated like the beta sub-flags below.
     os.environ["ENABLE_MANDATORY_BPS"] = str(enable_mandatory_bps).lower()
+    # ENABLE_STRICT_MANDATORY_BPS is non-beta and default-ON as well, so it
+    # is also written unconditionally. It is runtime-gated off by the server
+    # whenever ENABLE_MANDATORY_BPS is off (parent dependency, issue #1779).
+    os.environ["ENABLE_STRICT_MANDATORY_BPS"] = str(enable_strict_mandatory_bps).lower()
     # Beta sub-flags: only write env vars when the key is actually in
     # the addon's options.json. On stable addon,
     # none of these keys are in schema, so config.get(...) returned
@@ -705,12 +742,20 @@ def main() -> int:
 
     log_info("")
     log_info("=" * 80)
-    log_info(f"🔐 MCP Server URL: http://<home-assistant-ip>:9583{secret_path}")
-    log_info("")
-    log_info(f"   Secret Path: {secret_path}")
-    log_info("")
-    log_info("   ⚠️  IMPORTANT: Copy this exact URL - the secret path is required!")
-    log_info("   💡 This path is auto-generated and persisted to /data/secret_path.txt")
+    if enable_dag_studio:
+        # The dedicated fork treats the secret path as a bearer credential.
+        # It is persisted for the process but never copied into add-on logs.
+        log_info("MCP Server URL: http://<home-assistant-ip>:9583/<redacted>")
+        log_info("Secret path is configured and redacted from logs")
+    else:
+        log_info(f"🔐 MCP Server URL: http://<home-assistant-ip>:9583{secret_path}")
+        log_info("")
+        log_info(f"   Secret Path: {secret_path}")
+        log_info("")
+        log_info("   ⚠️  IMPORTANT: Copy this exact URL - the secret path is required!")
+        log_info(
+            "   💡 This path is auto-generated and persisted to /data/secret_path.txt"
+        )
     log_info("=" * 80)
     log_info("")
 
@@ -739,6 +784,13 @@ def main() -> int:
     # addon logs — only FastMCP's own banner does (via run_async). Mirrors how
     # FastMCP surfaces its update notice in these same startup logs.
     _log_startup_version()
+    if enable_dag_studio:
+        build_commit = os.getenv("HA_MCP_BUILD_COMMIT", "unknown")
+        log_info("Home Assistant MCP Server - DAG Studio (fork: resace3/ha-mcp)")
+        log_info(f"Fork commit: {build_commit[:12]}")
+        log_info("Container source: ghcr.io/resace3/ha-mcp-dag-addon")
+        log_info("Dedicated DAG profile: exactly 10 DAG tools; generic tools disabled")
+        log_info("DAG Studio route: authenticated Supervisor ingress only")
 
     # Re-apply the effective log level now that ha_mcp is imported —
     # the basicConfig above could only hardcode INFO. Without this, the
@@ -779,6 +831,11 @@ def main() -> int:
     register_settings_routes(
         server_instance.mcp, server_instance, secret_path=secret_path
     )
+    # DAG Studio is deliberately ingress-only: do not mount it under the
+    # public secret MCP path used by the webhook proxy.
+    from ha_mcp.dag_studio.routes import register_dag_studio_routes
+
+    register_dag_studio_routes(server_instance.mcp)
     logging.getLogger("mcp.server.streamable_http").addFilter(
         StatelessSessionLogFilter()
     )

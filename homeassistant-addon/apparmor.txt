@@ -1,0 +1,22 @@
+#include <tunables/global>
+
+profile ha_mcp_dag flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # Container filesystem only. No Home Assistant configuration directory is
+  # mounted; persistent writes are limited by the container layout to /data.
+  file,
+  /data/** rwk,
+  /tmp/** rwk,
+
+  # Python/FastMCP talks to Home Assistant/Supervisor and accepts the local
+  # ingress/proxy connection. Raw sockets and network administration are not
+  # permitted.
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+  network unix stream,
+
+  signal (send, receive) set=(kill,term,int,hup,cont),
+}

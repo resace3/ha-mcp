@@ -28,6 +28,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlow,
 )
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
     SelectOptionDict,
@@ -36,6 +37,7 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
 )
 from homeassistant.loader import async_get_integration
+from packaging.version import InvalidVersion, Version
 
 from .const import (
     BIND_HOST_ALL,
@@ -48,6 +50,8 @@ from .const import (
     DEFAULT_AUTO_UPDATE,
     DEFAULT_BIND_HOST,
     DEFAULT_CHANNEL,
+    DEFAULT_ENABLE_LLM_API,
+    DEFAULT_LLM_API_EXPOSURE,
     DEFAULT_LOOPBACK_URL,
     DEFAULT_PIP_SPEC,
     DEFAULT_SERVER_PORT,
@@ -56,11 +60,20 @@ from .const import (
     DOMAIN,
     ENTRY_TYPE_SERVER,
     ENTRY_TYPE_TOOLS,
+    EXPOSURE_BOTH,
+    EXPOSURE_FULL,
+    EXPOSURE_TOOL_SEARCH,
+    LLM_API_DOCS_URL,
+    MIN_EMBEDDED_HOME_ASSISTANT_VERSION,
     OPT_AUTO_UPDATE,
     OPT_BIND_HOST,
     OPT_CHANNEL,
+    OPT_ENABLE_LLM_API,
+    OPT_ENABLE_SIDEBAR_PANEL,
+    OPT_ENABLE_STARTUP_NOTIFICATION,
     OPT_ENABLE_WEBHOOK,
     OPT_EXTERNAL_URL,
+    OPT_LLM_API_EXPOSURE,
     OPT_PIP_SPEC,
     OPT_REGENERATE_SECRETS,
     OPT_SECRET_PATH_OVERRIDE,
@@ -166,6 +179,21 @@ class HaMcpToolsConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-arg]
         9584, LAN-reachable like the add-on, secret-URL auth); everything is
         tunable afterward in the integration options.
         """
+        try:
+            supported = Version(HA_VERSION) >= Version(
+                MIN_EMBEDDED_HOME_ASSISTANT_VERSION
+            )
+        except InvalidVersion:
+            supported = False
+        if not supported:
+            return self.async_abort(
+                reason="unsupported_home_assistant",
+                description_placeholders={
+                    "installed": HA_VERSION,
+                    "required": MIN_EMBEDDED_HOME_ASSISTANT_VERSION,
+                },
+            )
+
         await self.async_set_unique_id(_SERVER_UNIQUE_ID)
         self._abort_if_unique_id_configured()
 
@@ -252,32 +280,73 @@ class HaMcpServerOptionsFlow(OptionsFlow):
                 ),
                 vol.Optional(
                     OPT_PIP_SPEC,
-                    # Pre-fill only a genuinely saved override. The normalized
-                    # "no override" state renders an EMPTY field — pre-filling
-                    # DEFAULT_PIP_SPEC as a hint made a field whose help text
-                    # says "leave blank" always look populated, and showed the
-                    # STABLE dist name even on the dev channel.
-                    default=opts.get(OPT_PIP_SPEC, ""),
+                    # Pre-fill via suggested_value, NOT a schema default: a
+                    # default equal to the saved value makes the field
+                    # impossible to clear. HA's frontend drops an emptied
+                    # optional field from the submitted payload, so voluptuous
+                    # re-applies the default (the old override) and clearing
+                    # never sticks. suggested_value pre-fills the same value but
+                    # is not re-injected on an empty submit. (Applies to every
+                    # optional text field below.) Only a genuinely saved
+                    # override is suggested; the normalized "no override" state
+                    # renders an EMPTY field — the help text says "Leave empty",
+                    # and pre-filling DEFAULT_PIP_SPEC would show the STABLE dist
+                    # name even on the dev channel.
+                    description={"suggested_value": opts.get(OPT_PIP_SPEC, "")},
                 ): str,
                 vol.Optional(
                     OPT_SERVER_URL,
-                    default=opts.get(OPT_SERVER_URL, DEFAULT_LOOPBACK_URL),
+                    description={
+                        "suggested_value": opts.get(
+                            OPT_SERVER_URL, DEFAULT_LOOPBACK_URL
+                        )
+                    },
                 ): str,
                 vol.Required(
                     OPT_ENABLE_WEBHOOK,
                     default=bool(opts.get(OPT_ENABLE_WEBHOOK, True)),
                 ): bool,
+                vol.Required(
+                    OPT_ENABLE_STARTUP_NOTIFICATION,
+                    default=bool(opts.get(OPT_ENABLE_STARTUP_NOTIFICATION, True)),
+                ): bool,
+                vol.Required(
+                    OPT_ENABLE_SIDEBAR_PANEL,
+                    default=bool(opts.get(OPT_ENABLE_SIDEBAR_PANEL, True)),
+                ): bool,
+                vol.Required(
+                    OPT_ENABLE_LLM_API,
+                    default=bool(opts.get(OPT_ENABLE_LLM_API, DEFAULT_ENABLE_LLM_API)),
+                ): bool,
+                vol.Required(
+                    OPT_LLM_API_EXPOSURE,
+                    default=str(
+                        opts.get(OPT_LLM_API_EXPOSURE, DEFAULT_LLM_API_EXPOSURE)
+                    ),
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[EXPOSURE_TOOL_SEARCH, EXPOSURE_FULL, EXPOSURE_BOTH],
+                        translation_key="llm_api_exposure",
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                # suggested_value (not default) so these clear properly on an
+                # empty submit — see the OPT_PIP_SPEC note above.
                 vol.Optional(
                     OPT_EXTERNAL_URL,
-                    default=opts.get(OPT_EXTERNAL_URL, ""),
+                    description={"suggested_value": opts.get(OPT_EXTERNAL_URL, "")},
                 ): str,
                 vol.Optional(
                     OPT_WEBHOOK_ID_OVERRIDE,
-                    default=opts.get(OPT_WEBHOOK_ID_OVERRIDE, ""),
+                    description={
+                        "suggested_value": opts.get(OPT_WEBHOOK_ID_OVERRIDE, "")
+                    },
                 ): str,
                 vol.Optional(
                     OPT_SECRET_PATH_OVERRIDE,
-                    default=opts.get(OPT_SECRET_PATH_OVERRIDE, ""),
+                    description={
+                        "suggested_value": opts.get(OPT_SECRET_PATH_OVERRIDE, "")
+                    },
                 ): str,
                 vol.Optional(
                     OPT_REGENERATE_SECRETS,
@@ -285,25 +354,40 @@ class HaMcpServerOptionsFlow(OptionsFlow):
                 ): bool,
             }
         )
+        # The sidebar-panel sentence in the description is only truthful while
+        # the panel is registered; drop it (from the CURRENT stored options, not
+        # the unsaved form state) when the panel is off so the link cannot point
+        # at a route that 404s. The trailing space keeps the surrounding prose
+        # spaced correctly whether the sentence is present or empty.
+        panel_hint = (
+            "Open the [HA-MCP settings panel](/ha-mcp) for tool management and "
+            "server settings. "
+            if bool(opts.get(OPT_ENABLE_SIDEBAR_PANEL, True))
+            else ""
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=schema,
             description_placeholders={
                 "versions": await self._versions_hint(),
                 "connect_url": self._connect_url_hint(),
+                "llm_api_docs_url": LLM_API_DOCS_URL,
+                "panel_hint": panel_hint,
             },
         )
 
     @staticmethod
     def _normalize(user_input: dict[str, Any]) -> dict[str, Any]:
-        """Collapse the default pip spec to empty so it is not stored as an override.
+        """Normalize the submitted options before they are persisted.
 
-        The pip-spec field is pre-filled with ``DEFAULT_PIP_SPEC`` (the unpinned
-        ``ha-mcp`` distribution) as a hint. Persisting that value verbatim would
-        read as an intentional override and disable the stable channel's
-        automatic updates. Collapsing "equals the default" (or empty) to empty
-        keeps the entry tracking the selected channel; a genuine override (any
-        other string) is stored as-is.
+        Collapses the pip-spec field to empty when it is empty or equals
+        ``DEFAULT_PIP_SPEC`` (the unpinned ``ha-mcp`` distribution): the field is
+        pre-filled with the saved override or blank, but a user may also type the
+        default dist name, and persisting it verbatim would read as an
+        intentional override and disable the stable channel's automatic updates.
+        Empty means "no override" (track the selected channel); any other string
+        is a genuine override, stored as-is. Also strips the URL / secret
+        override fields, and drops a blank ``server_url`` so its default applies.
         """
         cleaned = dict(user_input)
         if cleaned.get(OPT_PIP_SPEC, "").strip() in ("", DEFAULT_PIP_SPEC):
@@ -315,6 +399,15 @@ class HaMcpServerOptionsFlow(OptionsFlow):
         ):
             cleaned[key] = str(cleaned.get(key, "") or "").strip()
         cleaned[OPT_EXTERNAL_URL] = cleaned[OPT_EXTERNAL_URL].rstrip("/")
+        # server_url gets no _normalize-forced empty like the fields above; strip
+        # it and drop it entirely when blank so a whitespace-only value can't be
+        # stored verbatim (it would bypass the consumer's empty -> loopback
+        # fallback and break the HA connection).
+        server_url = str(cleaned.get(OPT_SERVER_URL, "") or "").strip().rstrip("/")
+        if server_url:
+            cleaned[OPT_SERVER_URL] = server_url
+        else:
+            cleaned.pop(OPT_SERVER_URL, None)
         return cleaned
 
     async def _versions_hint(self) -> str:

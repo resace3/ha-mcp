@@ -19,7 +19,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Container
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NotRequired, TypedDict
 
@@ -37,6 +37,7 @@ from ..config import (
     get_global_settings,
 )
 from ..errors import ErrorCode, create_error_response
+from ..llm_exposure import LLM_API_CONFIG_KEY
 from ..transforms import DEFAULT_PINNED_TOOLS, categorize_capability
 from ..utils.data_paths import get_data_dir
 
@@ -1247,6 +1248,49 @@ def _schedule_supervisor_self_restart(
     task.add_done_callback(_BACKGROUND_RESTART_TASKS.discard)
 
 
+def _reject_child_flags_without_parent(
+    raw_flags: dict[str, Any],
+    parent_field: str,
+    child_fields: Container[str],
+    message: Callable[[list[str]], str],
+    suggestions: list[str],
+) -> JSONResponse | None:
+    """Reject a feature-flag save that enables child flags while their
+    parent stays off after the merge.
+
+    A child flag is only valid when ``parent_field`` is truthy AFTER the
+    merge. The post-merge parent is derived from the payload (if present),
+    else the live ``Settings`` value — the same value the runtime gate
+    will see. A child turned truthy against an
+    off parent would be forced back off at runtime, so reject it now
+    rather than let the user learn the save was a no-op at next startup.
+    Turning the parent off alone is NOT rejected: children absent from the
+    payload keep their persisted value and the runtime gate handles them.
+
+    Returns a 409 ``JSONResponse`` — ``message`` receives every offending
+    child, which is also echoed in ``context["rejected"]`` — or ``None``
+    when there is nothing to reject.
+    """
+    rejected = [k for k in raw_flags if k in child_fields and bool(raw_flags[k])]
+    effective_parent = bool(
+        raw_flags.get(
+            parent_field,
+            getattr(get_global_settings(), parent_field),
+        )
+    )
+    if rejected and not effective_parent:
+        return JSONResponse(
+            create_error_response(
+                ErrorCode.VALIDATION_INVALID_PARAMETER,
+                message(rejected),
+                suggestions=suggestions,
+                context={"rejected": rejected},
+            ),
+            status_code=409,
+        )
+    return None
+
+
 def build_settings_handlers(
     server: HomeAssistantSmartMCPServer | None,
     *,
@@ -1370,7 +1414,29 @@ def build_settings_handlers(
         # (their write actions are blocked at call time instead). The JS
         # uses this to keep their toggles live while force-disabling the
         # other write-capable tools' rows when the mode is on.
+        # Conversation-agent LLM API exposure (#1745): effective value per
+        # tool (override else default) so the UI toggle renders the truth,
+        # plus the raw overrides so it can tell "user-set" from "default".
+        from ..llm_exposure import effective_llm_api_exposed, load_llm_api_overrides
         from ..read_only import READ_ONLY_EXEMPT_TOOLS
+
+        llm_overrides = load_llm_api_overrides()
+        # Feature-gated stub rows carry their primary tag but NOT the "beta"
+        # tag the registered tool declares (_render_stub renders from
+        # FEATURE_GATED_TOOLS metadata, whose tags are never empty) — append
+        # it whenever disabled_by is set so the toggle renders
+        # hidden-by-default, matching what the stamp will say once the flag
+        # turns the real tool on. Every feature-gated tool is beta by
+        # definition. (Review finding: a previous `or`-fallback here was dead
+        # code, so beta stubs rendered as exposed.)
+        llm_effective = {
+            t["name"]: effective_llm_api_exposed(
+                t["name"],
+                [*(t.get("tags") or []), *(["beta"] if t.get("disabled_by") else [])],
+                llm_overrides,
+            )
+            for t in tools
+        }
 
         return JSONResponse(
             {
@@ -1378,6 +1444,8 @@ def build_settings_handlers(
                 "states": states,
                 "env_pinned": pinned,
                 "read_only_exempt": sorted(READ_ONLY_EXEMPT_TOOLS),
+                "llm_api": llm_effective,
+                "llm_api_overrides": llm_overrides,
             }
         )
 
@@ -1462,8 +1530,43 @@ def build_settings_handlers(
             name: state for name, state in states.items() if name not in env_pinned
         }
 
+        # Conversation-agent LLM API exposure overrides (#1745): a sparse
+        # {tool_name: bool} map, orthogonal to the states enum. Only bools
+        # persist — tools the user never flipped keep tracking their
+        # (deny-by-default for beta/dev/restart) defaults across releases.
+        raw_llm_api = body.get("llm_api", {})
+        if not isinstance(raw_llm_api, dict):
+            return JSONResponse(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "'llm_api' must be an object mapping tool names to booleans",
+                ),
+                status_code=400,
+            )
+        llm_api_overrides = {
+            name: value
+            for name, value in raw_llm_api.items()
+            if isinstance(name, str) and isinstance(value, bool)
+        }
+
         config = load_tool_config()
+
+        # The enable/disable/pin half still needs a restart to apply
+        # (visibility is wired at server build); the LLM-API exposure half
+        # applies live (stamped per tools/list). Only demand a restart when
+        # the half that needs one actually changed. Compare with the SAME
+        # default-pinned padding _get_tools applies to its response — the JS
+        # posts that padded map back verbatim, so an unpadded compare would
+        # flag every first save as a states change (live-found on #1745).
+        def _padded(tool_states: dict[str, str]) -> dict[str, str]:
+            padded = dict(tool_states)
+            for name in DEFAULT_PINNED_TOOLS:
+                padded.setdefault(name, "pinned")
+            return padded
+
+        states_changed = _padded(config.get("tools", {})) != _padded(states)
         config["tools"] = states
+        config[LLM_API_CONFIG_KEY] = llm_api_overrides
         if not save_tool_config(config):
             return JSONResponse(
                 create_error_response(
@@ -1480,9 +1583,13 @@ def build_settings_handlers(
         disabled_count = sum(1 for s in states.values() if s == "disabled")
         pinned_count = sum(1 for s in states.values() if s == "pinned")
         logger.info(
-            "Saved tool config (restart required to apply): %d disabled, %d pinned",
+            "Saved tool config (%s): %d disabled, %d pinned, %d LLM-API overrides",
+            "restart required to apply"
+            if states_changed
+            else "LLM-API exposure applies live",
             disabled_count,
             pinned_count,
+            len(llm_api_overrides),
         )
 
         # Same response shape as ``_save_feature_flags`` and
@@ -1496,8 +1603,9 @@ def build_settings_handlers(
             {
                 "success": True,
                 "applied": states,
+                "llm_api_applied": llm_api_overrides,
                 "mode": "file",
-                "restart_required": True,
+                "restart_required": states_changed,
             }
         )
 
@@ -1878,14 +1986,11 @@ def build_settings_handlers(
                 status_code=400,
             )
 
-        # Master beta-gate check: a sub-flag write is only valid
-        # when the master ``enable_beta_features`` is on AFTER the
-        # merge. Derive the post-merge master from the payload (if
-        # present), otherwise fall back to the live ``Settings`` value.
-        # Reject sub-flag writes that try to enable a beta when the
-        # resulting master state would still be off — the runtime gate
-        # would force them False anyway and the user should know the
-        # save was a no-op rather than learning at next startup.
+        # Master beta-gate check: a beta sub-flag may only be enabled
+        # when the master ``enable_beta_features`` is on AFTER the merge
+        # (see ``_reject_child_flags_without_parent`` for the post-merge
+        # derivation and why a parent-off-only save is not rejected). All
+        # offending sub-flags are listed in the rejection.
         #
         # Applied in BOTH standalone and addon mode.
         # The earlier "skip in addon mode" carve-out existed because
@@ -1894,43 +1999,61 @@ def build_settings_handlers(
         # one-cycle legacy bridge. On dev addon, start.py writes the
         # master env var from the schema-bound options key. On stable
         # addon, the master is not in schema and the standalone
-        # web-UI master path remains the gate (the gate read below
+        # web-UI master path remains the gate (the gate read
         # falls through to the override-file value). Either way the
         # gate is sound to apply uniformly.
         from ..config import (
             BETA_FEATURE_FIELDS as _BETA_SUB,
         )
 
-        effective_master = bool(
-            raw_flags.get(
-                "enable_beta_features",
-                getattr(get_global_settings(), "enable_beta_features", False),
-            )
+        beta_rejection = _reject_child_flags_without_parent(
+            raw_flags,
+            "enable_beta_features",
+            _BETA_SUB,
+            lambda rejected: (
+                "Cannot enable beta sub-flag(s) "
+                f"{', '.join(rejected)} while the master "
+                "'Enable beta features' toggle is off. Include "
+                "enable_beta_features=true in the same save, or "
+                "flip the master on first."
+            ),
+            [
+                "Include enable_beta_features=true in the same save "
+                + "payload as the sub-flag(s).",
+                "Or turn on the master 'Enable beta features' toggle "
+                + "first, then enable the sub-flag(s).",
+            ],
         )
-        beta_sub_writes = [
-            k for k in raw_flags if k in _BETA_SUB and bool(raw_flags[k])
-        ]
-        if beta_sub_writes and not effective_master:
-            return JSONResponse(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    (
-                        "Cannot enable beta sub-flag(s) "
-                        f"{', '.join(beta_sub_writes)} while the master "
-                        "'Enable beta features' toggle is off. Include "
-                        "enable_beta_features=true in the same save, or "
-                        "flip the master on first."
-                    ),
-                    suggestions=[
-                        "Include enable_beta_features=true in the same save "
-                        + "payload as the sub-flag(s).",
-                        "Or turn on the master 'Enable beta features' toggle "
-                        + "first, then enable the sub-flag(s).",
-                    ],
-                    context={"rejected": beta_sub_writes},
-                ),
-                status_code=409,
-            )
+        if beta_rejection is not None:
+            return beta_rejection
+
+        # Strict-mandatory-BPS dependency gate: strict mode
+        # (``enable_strict_mandatory_bps``) is a child of
+        # ``enable_mandatory_bps`` and is inert unless the parent is on.
+        # Same post-merge derivation and no-parent-off-rejection as the
+        # beta gate above (see ``_reject_child_flags_without_parent``).
+        strict_rejection = _reject_child_flags_without_parent(
+            raw_flags,
+            "enable_mandatory_bps",
+            ("enable_strict_mandatory_bps",),
+            lambda _rejected: (
+                "Cannot enable strict best-practices mode "
+                "('enable_strict_mandatory_bps') while the parent "
+                "'Attach best-practice skills on writes' "
+                "(enable_mandatory_bps) toggle is off. Strict mode is "
+                "a child of that toggle and has no effect without it. "
+                "Include enable_mandatory_bps=true in the same save, or "
+                "turn the parent on first."
+            ),
+            [
+                "Include enable_mandatory_bps=true in the same save "
+                + "payload as enable_strict_mandatory_bps.",
+                "Or turn on the parent 'Attach best-practice skills on "
+                + "writes' toggle first, then enable strict mode.",
+            ],
+        )
+        if strict_rejection is not None:
+            return strict_rejection
 
         # Build the validated override dict. Reject unknown fields and
         # env-locked fields up front so the user gets a precise error

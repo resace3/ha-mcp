@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from dotenv import load_dotenv
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ha_mcp._version import get_version, is_running_in_addon
@@ -83,6 +83,22 @@ class Settings(BaseSettings):
         20.0, alias="HAMCP_SCENE_CONFIG_TIME_BUDGET"
     )
 
+    # Per-request timeout and concurrency of the smart-search per-id
+    # config-fetch fallback (Attempt C). On HA servers that serve
+    # /config/<domain>/config/<id> serially, a full batch of concurrent
+    # requests queues behind one another and the tail of each batch can
+    # exceed the per-request timeout even though every request would
+    # succeed — lowering the batch size (toward 1) and/or raising the
+    # timeout lets such instances scan exhaustively (issue #1784). Same
+    # consumption model as the budgets above: import-time constants in
+    # tools/smart_search/_config.py, restart required.
+    individual_config_timeout: float = Field(
+        5.0, alias="HAMCP_INDIVIDUAL_CONFIG_TIMEOUT"
+    )
+    individual_fetch_batch_size: int = Field(
+        10, alias="HAMCP_INDIVIDUAL_FETCH_BATCH_SIZE"
+    )
+
     # Backup tool configuration
     backup_hint: str = Field("normal", alias="BACKUP_HINT")
 
@@ -95,6 +111,63 @@ class Settings(BaseSettings):
     # restarts (bookmarks, browser localStorage). Read by run_main() in
     # stdio_settings_sidecar.py.
     sidecar_pin_port: int = Field(0, alias="HA_MCP_SIDECAR_PORT")
+
+    # Optional Local DAG Studio. Disabled and loopback-only by default.
+    enable_dag_studio: bool = Field(False, alias="ENABLE_DAG_STUDIO")
+    dag_studio_host: str = Field("127.0.0.1", alias="DAG_STUDIO_HOST")
+    dag_studio_port: int = Field(8765, ge=1, le=65535, alias="DAG_STUDIO_PORT")
+    dag_studio_base_path: str = Field("/dag-studio", alias="DAG_STUDIO_BASE_PATH")
+    dag_studio_data_dir: str = Field("", alias="DAG_STUDIO_DATA_DIR")
+    dag_studio_open_browser: bool = Field(False, alias="DAG_STUDIO_OPEN_BROWSER")
+    dag_studio_allow_remote: bool = Field(False, alias="DAG_STUDIO_ALLOW_REMOTE")
+    dag_studio_session_ttl_minutes: int = Field(
+        480, ge=1, le=10080, alias="DAG_STUDIO_SESSION_TTL_MINUTES"
+    )
+    dag_studio_max_request_bytes: int = Field(
+        1048576, ge=1024, le=10485760, alias="DAG_STUDIO_MAX_REQUEST_BYTES"
+    )
+    dag_studio_ai_provider: Literal["disabled", "openai_compatible"] = Field(
+        "disabled", alias="DAG_STUDIO_AI_PROVIDER"
+    )
+    dag_studio_ai_base_url: str = Field("", alias="DAG_STUDIO_AI_BASE_URL")
+    dag_studio_ai_model: str = Field("", alias="DAG_STUDIO_AI_MODEL")
+    dag_studio_ai_api_key: str = Field("", alias="DAG_STUDIO_AI_API_KEY")
+    dag_studio_ai_timeout_seconds: int = Field(
+        60, ge=1, le=300, alias="DAG_STUDIO_AI_TIMEOUT_SECONDS"
+    )
+    dag_studio_ai_max_retries: int = Field(
+        1, ge=0, le=5, alias="DAG_STUDIO_AI_MAX_RETRIES"
+    )
+    dag_studio_ai_send_entity_values: bool = Field(
+        False, alias="DAG_STUDIO_AI_SEND_ENTITY_VALUES"
+    )
+    dag_studio_ai_rate_limit_per_minute: int = Field(
+        10, ge=1, le=120, alias="DAG_STUDIO_AI_RATE_LIMIT_PER_MINUTE"
+    )
+
+    @model_validator(mode="after")
+    def validate_dag_studio(self) -> "Settings":
+        import ipaddress
+
+        try:
+            loopback = ipaddress.ip_address(self.dag_studio_host).is_loopback
+        except ValueError:
+            loopback = self.dag_studio_host == "localhost"
+        if not loopback and not self.dag_studio_allow_remote:
+            raise ValueError(
+                "DAG_STUDIO_ALLOW_REMOTE=true is required for non-loopback binding"
+            )
+        if (
+            not self.dag_studio_base_path.startswith("/")
+            or ".." in self.dag_studio_base_path
+        ):
+            raise ValueError("DAG_STUDIO_BASE_PATH must be a safe absolute path")
+        if (
+            self.dag_studio_ai_provider != "disabled"
+            and not self.dag_studio_ai_model.strip()
+        ):
+            raise ValueError("DAG_STUDIO_AI_MODEL is required when AI is enabled")
+        return self
 
     # Development/Debug configuration
     debug: bool = Field(False, alias="DEBUG")
@@ -220,6 +293,18 @@ class Settings(BaseSettings):
     # master gate above that — when False, NO skill_content goes out
     # regardless of the per-call param or BP warnings. Default on.
     enable_mandatory_bps: bool = Field(True, alias="ENABLE_MANDATORY_BPS")
+
+    # Strict best-practices gate (issue #1779) — child flag of
+    # ``enable_mandatory_bps``. When effective, the six write tools are
+    # HARD-BLOCKED unless the call carries the acknowledgment key that is
+    # published only inside the best-practices skill content served by
+    # ``ha_get_skill_guide`` (modeled on the Hubitat MCP acknowledgment
+    # gate). Default ON so strict mode is active whenever the parent is on;
+    # inert when the parent is off — that cascade is enforced at the
+    # consumption site (``strict_bps.strict_bps_effective``), not here,
+    # because this flag is deliberately NOT a beta sub-flag and there is no
+    # config-level parent gate for non-beta flags.
+    enable_strict_mandatory_bps: bool = Field(True, alias="ENABLE_STRICT_MANDATORY_BPS")
 
     # Filesystem tools — read/write/delete/list under the HA config dir.
     # Previously gated by a direct ``os.getenv`` call in
@@ -350,21 +435,26 @@ class Settings(BaseSettings):
         "automation_config_time_budget",
         "script_config_time_budget",
         "scene_config_time_budget",
+        "individual_config_timeout",
+        "individual_fetch_batch_size",
         mode="before",
     )
     @classmethod
     def _lenient_time_budget(cls, v: object, info: ValidationInfo) -> object:
-        """Coerce the three smart-search time budgets, falling back to the
-        field default (with a warning) instead of crashing startup.
+        """Coerce the smart-search Attempt-C knobs (the three time budgets,
+        the per-request timeout, and the fetch batch size), falling back to
+        the field default (with a warning) instead of crashing startup.
 
         Preserves the parse-tolerance of the removed ``_env_float`` helper
         (empty / unparseable -> default) and additionally enforces the same
         ``_ADVANCED_SETTINGS_BOUNDS`` range as the override-file / UI-POST
         path, so the env-var path can't smuggle in an out-of-range or
-        non-finite budget. A ``<= 0`` budget would silently disable the
-        per-id config-fetch scan, and ``inf`` / ``nan`` would uncap it; the
-        ``lo <= val <= hi`` test rejects all three (NaN comparisons are
-        False), keeping the env and override-file paths consistent."""
+        non-finite value. A ``<= 0`` budget or timeout would silently
+        disable the per-id config-fetch scan, and ``inf`` / ``nan`` would
+        uncap it; the ``lo <= val <= hi`` test rejects all three (NaN
+        comparisons are False), keeping the env and override-file paths
+        consistent. Int fields (batch size) additionally reject fractional
+        values rather than truncating them."""
         field_name = info.field_name
         if field_name is None:  # always set for field_validator; defensive
             return v
@@ -389,6 +479,17 @@ class Settings(BaseSettings):
                 default,
             )
             return default
+        if isinstance(default, int) and not isinstance(default, bool):
+            if val != int(val):
+                logger.warning(
+                    "Invalid value for %s=%r (must be a whole number); "
+                    "using default %s",
+                    field_name,
+                    v,
+                    default,
+                )
+                return default
+            return int(val)
         return val
 
     @property
@@ -624,6 +725,12 @@ FEATURE_FLAG_FIELDS: tuple[FeatureFlagField, ...] = (
     # gated by the beta master) nor in ADVANCED_SETTINGS_FIELDS (registries
     # are name-disjoint per _validate_registries()).
     FeatureFlagField("enable_mandatory_bps", "ENABLE_MANDATORY_BPS", bool),
+    # Child flag of enable_mandatory_bps (#1779). Non-beta like its
+    # parent, so it belongs here and NOT in BETA_FEATURE_FIELDS; kept out
+    # of ADVANCED_SETTINGS_FIELDS too (registries are name-disjoint).
+    FeatureFlagField(
+        "enable_strict_mandatory_bps", "ENABLE_STRICT_MANDATORY_BPS", bool
+    ),
     FeatureFlagField("enable_yaml_config_editing", "ENABLE_YAML_CONFIG_EDITING", bool),
     FeatureFlagField("enable_yaml_edit_confirm", "ENABLE_YAML_EDIT_CONFIRM", bool),
     # Per-key sub-gates beneath enable_yaml_config_editing. Nested in
@@ -759,6 +866,22 @@ ADVANCED_SETTINGS_FIELDS: tuple[AdvancedField, ...] = (
         "search",
         True,
     ),
+    # Attempt-C per-request timeout + batch size (#1784). Restart-required
+    # (same import-time consumption as the budgets above).
+    AdvancedField(
+        "individual_config_timeout",
+        "HAMCP_INDIVIDUAL_CONFIG_TIMEOUT",
+        float,
+        "search",
+        True,
+    ),
+    AdvancedField(
+        "individual_fetch_batch_size",
+        "HAMCP_INDIVIDUAL_FETCH_BATCH_SIZE",
+        int,
+        "search",
+        True,
+    ),
     # Operations.
     AdvancedField("backup_hint", "BACKUP_HINT", str, "operations", True),
     AdvancedField("enable_websocket", "ENABLE_WEBSOCKET", bool, "operations", True),
@@ -846,6 +969,8 @@ _ADVANCED_SETTINGS_BOUNDS: dict[str, tuple[float, float]] = {
     "automation_config_time_budget": (1.0, 600.0),
     "script_config_time_budget": (1.0, 600.0),
     "scene_config_time_budget": (1.0, 600.0),
+    "individual_config_timeout": (1.0, 600.0),
+    "individual_fetch_batch_size": (1, 100),
     "code_mode_max_duration": (1.0, 300.0),
     "code_mode_max_memory": (1_048_576, 268_435_456),
     "code_mode_max_recursion": (1, 10_000),

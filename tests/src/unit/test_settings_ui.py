@@ -2450,6 +2450,160 @@ class TestEnvPinnedTools:
         _reset_global_settings()
 
     @pytest.mark.asyncio
+    async def test_save_tools_llm_api_only_change_needs_no_restart(
+        self, monkeypatch, tmp_path
+    ):
+        """An LLM-API-exposure-only save applies live: restart_required is
+        False even when the JS echoes back the GET response's default-pinned-
+        PADDED states map (live-found on #1745 — an unpadded compare flagged
+        every first save as a states change), and the override persists."""
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.delenv("DISABLED_TOOLS", raising=False)
+        monkeypatch.delenv("PINNED_TOOLS", raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        (tmp_path / "tool_config.json").write_text(
+            json.dumps({"tools": {"ha_other": "disabled"}})
+        )
+        from ha_mcp.config import _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+
+        get_resp = await handlers["get_tools"](MagicMock())
+        echoed_states = json.loads(get_resp.body)["states"]
+
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={
+                "states": echoed_states,
+                "llm_api": {"ha_manage_pipeline": False, "ha_bad": "nope"},
+            }
+        )
+        resp = await handlers["save_tools"](request)
+        body = json.loads(resp.body)
+        assert body["success"] is True
+        assert body["restart_required"] is False
+        # Only bool overrides persist.
+        assert body["llm_api_applied"] == {"ha_manage_pipeline": False}
+        saved = json.loads((tmp_path / "tool_config.json").read_text())
+        assert saved["llm_api"] == {"ha_manage_pipeline": False}
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_save_tools_states_change_still_needs_restart(
+        self, monkeypatch, tmp_path
+    ):
+        """A genuine enable/disable/pin change keeps restart_required True."""
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.delenv("DISABLED_TOOLS", raising=False)
+        monkeypatch.delenv("PINNED_TOOLS", raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        from ha_mcp.config import _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        request = MagicMock()
+        request.json = AsyncMock(
+            return_value={"states": {"ha_other": "disabled"}, "llm_api": {}}
+        )
+        resp = await handlers["save_tools"](request)
+        body = json.loads(resp.body)
+        assert body["success"] is True
+        assert body["restart_required"] is True
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_get_tools_llm_api_map_and_stub_beta_default(
+        self, monkeypatch, tmp_path
+    ):
+        """GET returns the effective llm_api map + raw overrides, and a
+        feature-gated STUB row (real tags, no "beta", disabled_by set) renders
+        hidden-by-default — matching the stamp the registered tool will carry
+        (review finding: stub tags are never empty, so an or-fallback was dead
+        code and beta stubs rendered as exposed)."""
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.delenv("DISABLED_TOOLS", raising=False)
+        monkeypatch.delenv("PINNED_TOOLS", raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        (tmp_path / "tool_config.json").write_text(
+            json.dumps({"tools": {}, "llm_api": {"ha_get_state": False}})
+        )
+        from ha_mcp import settings_ui as sui
+        from ha_mcp.config import _reset_global_settings
+
+        _reset_global_settings()
+        monkeypatch.setattr(
+            sui,
+            "load_tool_metadata_cache",
+            lambda: [
+                {
+                    "name": "ha_get_state",
+                    "title": "Get State",
+                    "primary_tag": "Entity",
+                    "tags": ["Entity"],
+                    "description": "x",
+                    "category": "read",
+                },
+                {
+                    "name": "ha_config_set_yaml",
+                    "title": "Set YAML Config",
+                    "primary_tag": "System",
+                    "tags": ["System"],  # stub: primary tag only, never "beta"
+                    "description": "x",
+                    "category": "write",
+                    "disabled_by": "enable_yaml_config_editing",
+                },
+            ],
+        )
+        handlers = sui.build_settings_handlers(server=None)
+        resp = await handlers["get_tools"](MagicMock())
+        body = json.loads(resp.body)
+
+        assert body["llm_api_overrides"] == {"ha_get_state": False}
+        # Override wins over the exposed default.
+        assert body["llm_api"]["ha_get_state"] is False
+        # The stub renders hidden-by-default (feature-gated == beta).
+        assert body["llm_api"]["ha_config_set_yaml"] is False
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_save_tools_rejects_non_dict_llm_api(self, monkeypatch, tmp_path):
+        """A non-dict llm_api payload is a structured 400, mirroring states."""
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.delenv("DISABLED_TOOLS", raising=False)
+        monkeypatch.delenv("PINNED_TOOLS", raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        from ha_mcp.config import _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        request = MagicMock()
+        request.json = AsyncMock(return_value={"states": {}, "llm_api": ["nope"]})
+        resp = await handlers["save_tools"](request)
+        assert resp.status_code == 400
+        assert "llm_api" in str(json.loads(resp.body))
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
     async def test_get_tools_includes_env_pinned_map(self, monkeypatch):
         """GET /api/settings/tools advertises env_pinned status so UI can
         render locked rows in Chunk 5b."""
@@ -3733,6 +3887,176 @@ def _http_request(
         "client": (peer_ip, 51234) if peer_ip is not None else None,
     }
     return Request(scope)
+
+
+class TestStrictMandatoryBpsGateInSave:
+    """Server-side rejection of enable_strict_mandatory_bps writes when the
+    parent enable_mandatory_bps toggle resolves off (issue #1779). Mirrors
+    TestBetaMasterGateInSave — strict mode is a non-beta child of
+    enable_mandatory_bps and inert unless the parent is on."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_strict_when_payload_turns_parent_off(
+        self, monkeypatch, tmp_path
+    ):
+        """POST {enable_mandatory_bps: false, enable_strict_mandatory_bps: true}
+        in one batch → 409. Post-merge parent is False, so the strict write
+        must be rejected."""
+        from ha_mcp.config import FEATURE_FLAG_FIELDS, _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        get_data_dir.cache_clear()
+        for _fname, ename, _ftype in FEATURE_FLAG_FIELDS:
+            monkeypatch.delenv(ename, raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        req = MagicMock()
+        req.json = AsyncMock(
+            return_value={
+                "flags": {
+                    "enable_mandatory_bps": False,
+                    "enable_strict_mandatory_bps": True,
+                }
+            }
+        )
+        resp = await handlers["save_feature_flags"](req)
+        assert resp.status_code == 409
+        body = json.loads(resp.body)
+        assert "enable_strict_mandatory_bps" in str(body)
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_rejects_strict_when_parent_already_off(self, monkeypatch, tmp_path):
+        """Parent persisted off + POST {enable_strict_mandatory_bps: true} with
+        no parent in the payload → 409 (effective parent is the file value)."""
+        from ha_mcp.config import FEATURE_FLAG_FIELDS, _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        get_data_dir.cache_clear()
+        for _fname, ename, _ftype in FEATURE_FLAG_FIELDS:
+            monkeypatch.delenv(ename, raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        (tmp_path / "feature_flags.json").write_text(
+            json.dumps({"enable_mandatory_bps": False})
+        )
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        req = MagicMock()
+        req.json = AsyncMock(
+            return_value={"flags": {"enable_strict_mandatory_bps": True}}
+        )
+        resp = await handlers["save_feature_flags"](req)
+        assert resp.status_code == 409
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_accepts_strict_when_parent_on_default(self, monkeypatch, tmp_path):
+        """POST {enable_strict_mandatory_bps: true} with no parent in the
+        payload succeeds — the parent defaults ON, so effective parent = True."""
+        from ha_mcp.config import FEATURE_FLAG_FIELDS, _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        get_data_dir.cache_clear()
+        for _fname, ename, _ftype in FEATURE_FLAG_FIELDS:
+            monkeypatch.delenv(ename, raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        req = MagicMock()
+        req.json = AsyncMock(
+            return_value={"flags": {"enable_strict_mandatory_bps": True}}
+        )
+        resp = await handlers["save_feature_flags"](req)
+        assert resp.status_code == 200
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_accepts_parent_and_strict_in_same_batch(self, monkeypatch, tmp_path):
+        """POST {enable_mandatory_bps: true, enable_strict_mandatory_bps: true}
+        in one batch succeeds — parent state is derived AFTER merge."""
+        from ha_mcp.config import FEATURE_FLAG_FIELDS, _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        get_data_dir.cache_clear()
+        for _fname, ename, _ftype in FEATURE_FLAG_FIELDS:
+            monkeypatch.delenv(ename, raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        req = MagicMock()
+        req.json = AsyncMock(
+            return_value={
+                "flags": {
+                    "enable_mandatory_bps": True,
+                    "enable_strict_mandatory_bps": True,
+                }
+            }
+        )
+        resp = await handlers["save_feature_flags"](req)
+        assert resp.status_code == 200
+        get_data_dir.cache_clear()
+        _reset_global_settings()
+
+    @pytest.mark.asyncio
+    async def test_accepts_parent_off_alone_and_preserves_strict_value(
+        self, monkeypatch, tmp_path
+    ):
+        """Parent + strict both persisted on, then POST {enable_mandatory_bps:
+        false} with NO enable_strict_mandatory_bps in the payload → 200. The
+        gate rejects only a payload that *writes* a truthy child against an
+        off parent; turning the parent off alone is accepted (the runtime gate
+        renders strict inert without clobbering its saved value). Mirrors the
+        beta gate's test_save_features_master_off_preserves_subflag_values."""
+        from ha_mcp.config import FEATURE_FLAG_FIELDS, _reset_global_settings
+        from ha_mcp.settings_ui import build_settings_handlers
+        from ha_mcp.utils.data_paths import get_data_dir
+
+        get_data_dir.cache_clear()
+        monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
+        get_data_dir.cache_clear()
+        for _fname, ename, _ftype in FEATURE_FLAG_FIELDS:
+            monkeypatch.delenv(ename, raising=False)
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        # Pre-existing state: parent on + strict on (strict live/persisted true).
+        (tmp_path / "feature_flags.json").write_text(
+            json.dumps(
+                {
+                    "enable_mandatory_bps": True,
+                    "enable_strict_mandatory_bps": True,
+                }
+            )
+        )
+        _reset_global_settings()
+        handlers = build_settings_handlers(server=None)
+        req = MagicMock()
+        # User flips ONLY the parent off — strict absent from the payload.
+        req.json = AsyncMock(return_value={"flags": {"enable_mandatory_bps": False}})
+        resp = await handlers["save_feature_flags"](req)
+        assert resp.status_code == 200, json.loads(resp.body)
+        on_disk = json.loads((tmp_path / "feature_flags.json").read_text())
+        assert on_disk["enable_mandatory_bps"] is False
+        # Strict value is PRESERVED so flipping the parent back on restores it.
+        assert on_disk["enable_strict_mandatory_bps"] is True, (
+            "strict value was clobbered on parent-off — should have stayed True"
+        )
+        get_data_dir.cache_clear()
+        _reset_global_settings()
 
 
 class TestIngressOnlyGuard:

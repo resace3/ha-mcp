@@ -21,6 +21,7 @@ from ..client.rest_client import (
     HomeAssistantConnectionError,
 )
 from ..errors import ErrorCode, create_error_response
+from ..strict_bps import BestPracticeKeyParam
 from ..utils.config_hash import compute_config_hash
 from ..utils.python_sandbox import (
     PythonSandboxError,
@@ -248,32 +249,17 @@ class ConfigSceneTools:
                 ],
                 context={"scene_id": scene_id},
             )
-            # Issue #1168 R3 blockers 3 + 6: unwrap the rest-client envelope
-            # so the response carries the scene body directly (no nested
-            # `success`/`scene_id`/`config` chain), and use the storage key
-            # consistently for `scene_id` regardless of whether the caller
-            # passed the entity_id slug or the storage key.
-            envelope = await self._client.get_scene_config(scene_id)
-            actual_config = envelope.get("config", envelope)
-            resolved_id = envelope.get("scene_id", scene_id)
-            config_hash_value = compute_config_hash(actual_config)
-
-            # Resolve real entity_id via registry — see _resolve_scene_entity_id
-            # for the reasoning. Category fetch on the wrong entity_id is a
-            # silent no-op, masking real category assignments.
-            entity_id = await self._resolve_scene_entity_id(resolved_id)
-            cat_id = await fetch_entity_category(self._client, entity_id, "scene")
-
-            response: dict[str, Any] = {
-                "success": True,
-                "action": "get",
-                "scene_id": resolved_id,
-                "config": actual_config,
-                "config_hash": config_hash_value,
-            }
-            if cat_id:
-                response["category"] = cat_id
-            return response
+            # Scenes ALWAYS take the legacy path — deliberately no component
+            # routing here, unlike the automation/script gets. Scenes do not
+            # retain their raw storage body in memory: HomeAssistantScene's
+            # ``scene_config.states`` holds runtime State OBJECTS built at
+            # setup, not the storage ``entities`` dict, so a component-served
+            # body can neither match the REST body byte-for-byte nor produce
+            # a stable ``config_hash`` — and the get -> surgical-edit -> set
+            # round-trip depends on both (caught live by the scene lifecycle
+            # e2e suite). automation/script expose ``raw_config`` (the exact
+            # storage dict), which is why their gets DO route.
+            return await self._legacy_get_scene(scene_id)
         except ToolError:
             raise
         except Exception as e:
@@ -299,8 +285,45 @@ class ConfigSceneTools:
             # ``return None`` fall-through) and is never reached at runtime.
             raise
 
+    async def _legacy_get_scene(self, scene_id: str) -> dict[str, Any]:
+        """Assemble the scene-get response from the REST/WS pipeline.
+
+        The multi-fetch path: id-resolution WS + per-id config REST +
+        ``_resolve_scene_entity_id`` WS + ``fetch_entity_category`` WS. This is
+        the ONLY scene-get path — see ``ha_config_get_scene`` for why scenes
+        never route through the component's ``config_get`` (their in-memory
+        ``scene_config.states`` is runtime State objects, not the storage
+        ``entities`` dict).
+        """
+        # Issue #1168 R3 blockers 3 + 6: unwrap the rest-client envelope
+        # so the response carries the scene body directly (no nested
+        # `success`/`scene_id`/`config` chain), and use the storage key
+        # consistently for `scene_id` regardless of whether the caller
+        # passed the entity_id slug or the storage key.
+        envelope = await self._client.get_scene_config(scene_id)
+        actual_config = envelope.get("config", envelope)
+        resolved_id = envelope.get("scene_id", scene_id)
+        config_hash_value = compute_config_hash(actual_config)
+
+        # Resolve real entity_id via registry — see _resolve_scene_entity_id
+        # for the reasoning. Category fetch on the wrong entity_id is a
+        # silent no-op, masking real category assignments.
+        entity_id = await self._resolve_scene_entity_id(resolved_id)
+        cat_id = await fetch_entity_category(self._client, entity_id, "scene")
+
+        response: dict[str, Any] = {
+            "success": True,
+            "action": "get",
+            "scene_id": resolved_id,
+            "config": actual_config,
+            "config_hash": config_hash_value,
+        }
+        if cat_id:
+            response["category"] = cat_id
+        return response
+
     async def _get_scene_config_internal(
-        self, scene_id: str
+        self, scene_id: str, *, _resolved: bool = False
     ) -> tuple[dict[str, Any], str, str]:
         """Fetch scene config without logging or category injection.
 
@@ -308,8 +331,12 @@ class ConfigSceneTools:
         ``actual_config`` is the inner scene body (not the REST wrapper) and
         ``resolved_id`` is the storage key the rest-client resolved the input
         to (issue #1168 R3 blocker 6). Used by ``_fetch_and_verify_hash``.
+
+        ``_resolved=True`` forwards to ``get_scene_config`` that ``scene_id`` is
+        already a resolved storage key, so the redundant registry lookup is
+        skipped (e.g. the python_transform re-fetch, which already resolved).
         """
-        envelope = await self._client.get_scene_config(scene_id)
+        envelope = await self._client.get_scene_config(scene_id, _resolved=_resolved)
         actual_config = envelope.get("config", envelope)
         resolved_id = envelope.get("scene_id", scene_id.removeprefix("scene."))
         config_hash_value = compute_config_hash(actual_config)
@@ -500,6 +527,9 @@ class ConfigSceneTools:
             bool,
             Field(default=True),
         ] = True,
+        # BestPracticeKey (#1779): consumed by StrictBpsMiddleware, never read
+        # here — see strict_bps.py for the declaration contract.
+        BestPracticeKey: BestPracticeKeyParam = None,
     ) -> dict[str, Any]:
         """
         Create or update a Home Assistant scene. MUST call ha_get_skill_guide first.
@@ -734,12 +764,13 @@ class ConfigSceneTools:
                     await self._validate_category_id(category)
 
                 result = await self._client.upsert_scene_config(
-                    transformed_config, resolved_id
+                    transformed_config, resolved_id, _resolved=True
                 )
 
                 # Re-fetch to get authoritative hash (HA may normalise after save).
+                # ``resolved_id`` is already the storage key, so skip the re-resolve.
                 _, new_config_hash, _ = await self._get_scene_config_internal(
-                    resolved_id
+                    resolved_id, _resolved=True
                 )
 
                 # Resolve actual entity_id and apply wait + category — same
@@ -861,7 +892,11 @@ class ConfigSceneTools:
                 self._client, config_dict
             )
 
-            result = await self._client.upsert_scene_config(config_dict, resolved_id)
+            # ``resolved_id`` is already the storage key (from the hash-verify
+            # fetch or the resolve above), so skip the redundant re-resolve.
+            result = await self._client.upsert_scene_config(
+                config_dict, resolved_id, _resolved=True
+            )
 
             # Resolve actual entity_id via registry — HA derives scene
             # entity_ids from the 'name' slug, not the scene_id storage key,
@@ -1007,7 +1042,9 @@ class ConfigSceneTools:
             # matching unique_id (e.g. scene_id-as-entity-id slug case).
             entity_id = await self._resolve_scene_entity_id(resolved_id)
 
-            result = await self._client.delete_scene_config(resolved_id)
+            # ``resolved_id`` is already the storage key (resolved above), so
+            # skip the redundant re-resolve inside delete_scene_config.
+            result = await self._client.delete_scene_config(resolved_id, _resolved=True)
 
             if wait:
                 try:

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Local DAG Studio</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color:#172033;background:#f4f6fa;line-height:1.4}
+    *{box-sizing:border-box}body{margin:0}header{background:#17233c;color:#fff;padding:12px 18px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}header h1{font-size:18px;margin:0 auto 0 0}.notice{background:#fff7d6;border:1px solid #e0b91e;padding:8px 12px;margin:10px;border-radius:8px}.layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:10px;padding:10px}.panel{background:#fff;border:1px solid #d8deea;border-radius:10px;padding:12px;min-width:0}.workspace{display:grid;gap:10px}.toolbar{display:flex;gap:6px;flex-wrap:wrap}button,input,select,textarea{font:inherit;border:1px solid #9da9bc;border-radius:6px;padding:7px;background:#fff}button{cursor:pointer}button.primary{background:#0875d1;color:#fff;border-color:#0875d1}button.danger{background:#b3261e;color:#fff;border-color:#b3261e}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #64b5f6;outline-offset:2px}label{display:grid;gap:3px;margin:6px 0}.doc-list{display:grid;gap:5px}.doc-list button{text-align:left;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}.row{border:1px solid #d8deea;border-radius:8px;padding:8px;display:grid;gap:6px}.row-actions{display:flex;gap:5px;flex-wrap:wrap}.status{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto}.error{color:#a1160a}.success{color:#176b2c}.muted{color:#56647a}.sr-only{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0);overflow:hidden}@media(max-width:760px){.layout{grid-template-columns:1fr}.panel{padding:9px}}
+  </style>
+</head>
+<body>
+  <header><h1>Local DAG Studio</h1><button id="new">New</button><button id="save" class="primary">Save</button><button id="reload">Reload</button><button id="validate">Validate</button></header>
+  <p class="notice">Raw Home Assistant history stays on this Home Assistant. Every graph is a hypothesis, not proof of causality. Approval and deletion require explicit confirmation.</p>
+  <main class="layout">
+    <aside class="panel"><h2>Documents</h2><div id="documents" class="doc-list"></div></aside>
+    <section class="workspace">
+      <section class="panel">
+        <h2>Document</h2>
+        <div class="grid"><label>ID<input id="docId" maxlength="100" pattern="[A-Za-z0-9_.:-]+"></label><label>Title<input id="title" maxlength="200"></label></div>
+        <label>Causal question<textarea id="question" maxlength="2000" rows="2"></textarea></label>
+        <div class="toolbar"><button id="import">Import JSON</button><input id="importFile" class="sr-only" type="file" accept="application/json"><button id="exportJson">Export JSON</button><button id="exportDot">Export DOT</button><button id="approve">Preview & approve</button><button id="delete" class="danger">Preview & delete</button></div>
+        <p id="meta" class="muted"></p>
+      </section>
+      <section class="panel"><div class="toolbar"><h2>Nodes</h2><button id="addNode">Add node</button></div><div id="nodes" class="grid"></div></section>
+      <section class="panel"><div class="toolbar"><h2>Directed edges</h2><button id="addEdge">Add edge</button></div><div id="edges" class="grid"></div></section>
+      <section class="panel"><div class="toolbar"><h2>Revisions</h2><button id="refreshRevisions">Refresh</button></div><div id="revisions" class="toolbar"></div></section>
+      <section class="panel"><h2>Validation and activity</h2><div id="status" class="status" role="status" aria-live="polite"></div></section>
+    </section>
+  </main>
+  <script src="./app.js"></script>
+</body>
+</html>

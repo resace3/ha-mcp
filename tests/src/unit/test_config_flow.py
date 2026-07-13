@@ -52,6 +52,10 @@ _core = MagicMock()
 _core.callback = lambda func: func  # identity so async_get_options_flow builds
 sys.modules["homeassistant.core"] = _core
 
+_ha_const = MagicMock()
+_ha_const.__version__ = "2026.6.0"
+sys.modules["homeassistant.const"] = _ha_const
+
 
 # Inert selector stand-ins: the options flow builds SelectSelector dropdowns,
 # but these tests hand user_input straight to the handler, so the selector
@@ -116,6 +120,7 @@ def _make_flow() -> cf.HaMcpToolsConfigFlow:
     flow._abort_if_unique_id_configured = MagicMock(return_value=None)
     flow.async_show_menu = MagicMock(side_effect=lambda **kw: {"type": "menu", **kw})
     flow.async_show_form = MagicMock(side_effect=lambda **kw: {"type": "form", **kw})
+    flow.async_abort = MagicMock(side_effect=lambda **kw: {"type": "abort", **kw})
     flow.async_create_entry = MagicMock(
         side_effect=lambda **kw: {"type": "entry", **kw}
     )
@@ -164,6 +169,14 @@ class TestToolsBranch:
         flow.async_set_unique_id.assert_awaited_once_with(const.DOMAIN)
         flow._abort_if_unique_id_configured.assert_called_once()
 
+    def test_tools_remains_available_on_older_home_assistant(self, monkeypatch):
+        monkeypatch.setattr(cf, "HA_VERSION", "2024.11.0")
+        flow = _make_flow()
+
+        entry = asyncio.run(flow.async_step_tools({}))
+
+        assert entry["type"] == "entry"
+
 
 class TestServerBranch:
     def test_server_step_shows_confirm_form(self):
@@ -187,6 +200,20 @@ class TestServerBranch:
         flow._abort_if_unique_id_configured.assert_called_once()
         # Distinct from the tools entry's unique id so both can coexist.
         assert cf._SERVER_UNIQUE_ID != const.DOMAIN
+
+    def test_server_aborts_on_unsupported_home_assistant(self, monkeypatch):
+        monkeypatch.setattr(cf, "HA_VERSION", "2025.9.4")
+        flow = _make_flow()
+
+        result = asyncio.run(flow.async_step_server(None))
+
+        assert result["type"] == "abort"
+        assert result["reason"] == "unsupported_home_assistant"
+        assert result["description_placeholders"] == {
+            "installed": "2025.9.4",
+            "required": "2026.6.0",
+        }
+        flow.async_set_unique_id.assert_not_awaited()
 
 
 class TestOptionsFlowDispatch:
@@ -307,7 +334,10 @@ class TestServerOptionsFlow:
     def test_form_prefills_every_field_from_saved_options(self):
         # Review gap: the form must show the user's SAVED values, not the
         # defaults, for every field (a regression here silently reverts a
-        # user's config on the next save).
+        # user's config on the next save). Dropdowns/toggles pre-fill via the
+        # schema default; the optional text fields pre-fill via suggested_value
+        # (a default there would make them impossible to clear — see
+        # test_clearing_an_override_field_sticks).
         saved = {
             const.OPT_CHANNEL: const.CHANNEL_DEV,
             const.OPT_AUTO_UPDATE: False,
@@ -316,6 +346,10 @@ class TestServerOptionsFlow:
             const.OPT_WEBHOOK_AUTH: const.WEBHOOK_AUTH_HA,
             const.OPT_PIP_SPEC: "ha-mcp==0.0.1",
             const.OPT_SERVER_URL: "https://ha.example:8123",
+            # Saved False (non-default) proves the LLM-API toggle prefills.
+            const.OPT_ENABLE_LLM_API: False,
+            # Saved full (non-default) proves the exposure selector prefills.
+            const.OPT_LLM_API_EXPOSURE: const.EXPOSURE_FULL,
             const.OPT_EXTERNAL_URL: "https://ha.example.com",
             const.OPT_WEBHOOK_ID_OVERRIDE: "my_custom_hook",
             const.OPT_SECRET_PATH_OVERRIDE: "/custom_path",
@@ -324,14 +358,36 @@ class TestServerOptionsFlow:
             data={const.DATA_WEBHOOK_ID: "mcp_abc"}, options=saved
         )
         form = asyncio.run(flow.async_step_init(None))
-        defaults = {m.schema: m.default() for m in form["data_schema"].schema}
+        markers = {m.schema: m for m in form["data_schema"].schema}
+
+        # Optional text fields pre-fill via suggested_value so they stay
+        # clearable; every other field pre-fills via the schema default.
+        text_fields = (
+            const.OPT_PIP_SPEC,
+            const.OPT_SERVER_URL,
+            const.OPT_EXTERNAL_URL,
+            const.OPT_WEBHOOK_ID_OVERRIDE,
+            const.OPT_SECRET_PATH_OVERRIDE,
+        )
+        for key in text_fields:
+            assert markers[key].description["suggested_value"] == saved[key]
+
+        defaults = {
+            key: m.default() for key, m in markers.items() if key not in text_fields
+        }
         # regenerate_secrets is a one-shot action, never pre-filled True;
-        # enable_webhook defaults on when unsaved.
+        # enable_webhook / enable_startup_notification / enable_sidebar_panel
+        # default on when unsaved. Pop off the schema (not inside assert, which
+        # `python -O` would strip) before comparing the remainder.
         regenerate_default = defaults.pop(const.OPT_REGENERATE_SECRETS)
         assert regenerate_default is False
         webhook_default = defaults.pop(const.OPT_ENABLE_WEBHOOK)
         assert webhook_default is True
-        assert defaults == saved
+        notification_default = defaults.pop(const.OPT_ENABLE_STARTUP_NOTIFICATION)
+        assert notification_default is True
+        panel_default = defaults.pop(const.OPT_ENABLE_SIDEBAR_PANEL)
+        assert panel_default is True
+        assert defaults == {k: v for k, v in saved.items() if k not in text_fields}
 
     def test_init_submit_round_trips_input_into_entry(self):
         flow = _make_options_flow()
@@ -371,6 +427,31 @@ class TestServerOptionsFlow:
         )
         assert result["data"][const.OPT_PIP_SPEC] == ""
 
+    def test_server_url_whitespace_is_dropped_to_default(self):
+        # A whitespace-only Home Assistant URL must not be stored verbatim: it is
+        # truthy, so it would bypass the consumer's empty -> loopback fallback and
+        # break the connection. _normalize drops it so the default applies.
+        flow = _make_options_flow()
+        result = asyncio.run(
+            flow.async_step_init(
+                {const.OPT_CHANNEL: const.CHANNEL_STABLE, const.OPT_SERVER_URL: "   "}
+            )
+        )
+        assert const.OPT_SERVER_URL not in result["data"]
+
+    def test_server_url_trailing_slash_stripped(self):
+        # A real URL is kept, with any trailing slash trimmed.
+        flow = _make_options_flow()
+        result = asyncio.run(
+            flow.async_step_init(
+                {
+                    const.OPT_CHANNEL: const.CHANNEL_STABLE,
+                    const.OPT_SERVER_URL: "http://ha.local:8123/",
+                }
+            )
+        )
+        assert result["data"][const.OPT_SERVER_URL] == "http://ha.local:8123"
+
     def test_pip_spec_field_empty_when_no_override(self):
         # The "leave blank to follow the channel" field must actually BE
         # blank when no override is stored — pre-filling the default dist
@@ -382,12 +463,114 @@ class TestServerOptionsFlow:
         marker = next(
             m for m in form["data_schema"].schema if m.schema == const.OPT_PIP_SPEC
         )
-        assert marker.default() == ""
+        assert marker.description["suggested_value"] == ""
+
+    def test_clearing_an_override_field_sticks(self):
+        # Regression: emptying an optional text field must persist as cleared.
+        # HA's frontend DROPS an emptied optional field from the submitted
+        # payload; the flow manager then validates that payload against the
+        # shown schema (filling voluptuous defaults) before the step handler
+        # runs — the layer a direct-handler unit test skips. A schema
+        # ``default=<saved value>`` silently re-injects the old value there, so
+        # clearing never took: the pip-spec override kept re-installing the old
+        # build and the field re-appeared populated on reopen. Pre-filling with
+        # ``suggested_value`` (not ``default``) has no such re-injection, so the
+        # cleared state sticks.
+        clearable = {
+            const.OPT_PIP_SPEC: "ha-mcp @ https://example/x.tgz",
+            const.OPT_SERVER_URL: "https://ha.example:8123",
+            const.OPT_EXTERNAL_URL: "https://ha.example.com",
+            const.OPT_WEBHOOK_ID_OVERRIDE: "my_custom_hook",
+            const.OPT_SECRET_PATH_OVERRIDE: "/custom_path",
+        }
+        for field in clearable:
+            flow = _make_options_flow(
+                data={const.DATA_WEBHOOK_ID: "mcp_abc"}, options=dict(clearable)
+            )
+            form = asyncio.run(flow.async_step_init(None))
+            # The user cleared exactly one field; the frontend omits it and
+            # submits the rest. Validate through the shown schema exactly as the
+            # flow manager does, then hand the result to the step.
+            submitted = {k: v for k, v in clearable.items() if k != field}
+            validated = form["data_schema"](submitted)
+            result = asyncio.run(flow.async_step_init(validated))
+            assert result["data"].get(field, "") == "", (
+                f"clearing {field!r} did not persist: {result['data'].get(field)!r}"
+            )
 
     def test_no_enable_toggle_option_exists(self):
         # Regression guard for the single-instance pivot: the enable/disable
         # toggle was dropped (entry-exists = server runs).
         assert not hasattr(const, "OPT_EMBEDDED_ENABLED")
+
+    def test_new_toggles_default_on_for_fresh_entry(self):
+        # Both UX toggles (start-up notification, sidebar panel) are present in
+        # the rendered schema and default on when the entry has never stored
+        # them.
+        flow = _make_options_flow(data={const.DATA_WEBHOOK_ID: "mcp_abc"})
+        form = asyncio.run(flow.async_step_init(None))
+        markers = {m.schema: m for m in form["data_schema"].schema}
+        assert const.OPT_ENABLE_STARTUP_NOTIFICATION in markers
+        assert markers[const.OPT_ENABLE_STARTUP_NOTIFICATION].default() is True
+        assert const.OPT_ENABLE_SIDEBAR_PANEL in markers
+        assert markers[const.OPT_ENABLE_SIDEBAR_PANEL].default() is True
+
+    def test_new_toggles_placed_right_after_enable_webhook(self):
+        # Contract: both toggles sit immediately after the enable_webhook field.
+        flow = _make_options_flow(data={const.DATA_WEBHOOK_ID: "mcp_abc"})
+        form = asyncio.run(flow.async_step_init(None))
+        keys = [m.schema for m in form["data_schema"].schema]
+        webhook_idx = keys.index(const.OPT_ENABLE_WEBHOOK)
+        assert set(keys[webhook_idx + 1 : webhook_idx + 3]) == {
+            const.OPT_ENABLE_STARTUP_NOTIFICATION,
+            const.OPT_ENABLE_SIDEBAR_PANEL,
+        }
+
+    def test_new_toggles_prefill_stored_false(self):
+        # Re-opening the form after saving False shows the stored False, not the
+        # default True (a regression here silently re-enables an opted-out UI).
+        flow = _make_options_flow(
+            data={const.DATA_WEBHOOK_ID: "mcp_abc"},
+            options={
+                const.OPT_ENABLE_STARTUP_NOTIFICATION: False,
+                const.OPT_ENABLE_SIDEBAR_PANEL: False,
+            },
+        )
+        form = asyncio.run(flow.async_step_init(None))
+        markers = {m.schema: m for m in form["data_schema"].schema}
+        assert markers[const.OPT_ENABLE_STARTUP_NOTIFICATION].default() is False
+        assert markers[const.OPT_ENABLE_SIDEBAR_PANEL].default() is False
+
+    def test_submitting_false_stores_false_for_new_toggles(self):
+        # Submitting the form with both toggles unchecked persists False.
+        flow = _make_options_flow()
+        user_input = {
+            const.OPT_CHANNEL: const.CHANNEL_STABLE,
+            const.OPT_ENABLE_STARTUP_NOTIFICATION: False,
+            const.OPT_ENABLE_SIDEBAR_PANEL: False,
+        }
+        result = asyncio.run(flow.async_step_init(user_input))
+        assert result["type"] == "entry"
+        assert result["data"][const.OPT_ENABLE_STARTUP_NOTIFICATION] is False
+        assert result["data"][const.OPT_ENABLE_SIDEBAR_PANEL] is False
+
+    def test_panel_hint_contains_panel_url_when_sidebar_enabled(self):
+        # panel_hint is a non-empty sentence naming the panel URL when the
+        # sidebar option is enabled (absent counts as enabled).
+        flow = _make_options_flow(data={const.DATA_WEBHOOK_ID: "mcp_abc"})
+        form = asyncio.run(flow.async_step_init(None))
+        hint = form["description_placeholders"]["panel_hint"]
+        assert hint
+        assert "(/ha-mcp)" in hint
+
+    def test_panel_hint_empty_when_sidebar_disabled(self):
+        # With the sidebar option stored False, the panel hint collapses to "".
+        flow = _make_options_flow(
+            data={const.DATA_WEBHOOK_ID: "mcp_abc"},
+            options={const.OPT_ENABLE_SIDEBAR_PANEL: False},
+        )
+        form = asyncio.run(flow.async_step_init(None))
+        assert form["description_placeholders"]["panel_hint"] == ""
 
     def test_connect_url_hint_uses_configured_port(self):
         flow = _make_options_flow(

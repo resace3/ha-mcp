@@ -126,7 +126,8 @@ configuration:
       existing MCP tools (call_tool), or remove a saved tool
       (delete_saved_tool). Saved tools persist to
       /data/saved_tools.json by default so they survive add-on
-      restarts. See docs/beta.md for known limitations. Requires
+      restarts, and are visible to any client that can connect. See
+      docs/beta.md for known limitations. Requires
       restart to take effect. REQUIRES the master "Enable beta
       features" toggle above (and in the web UI) to be on — otherwise
       this sub-flag is ignored at runtime regardless of its value
@@ -189,6 +190,17 @@ configuration:
       benefits from inline guidance; turn off to minimise tokens when
       using an LLM that has the best-practice files indexed via skills
       or another retrieval path. Requires restart to take effect.
+  enable_strict_mandatory_bps:
+    name: Strict best-practices mode
+    description: >-
+      Strict mode: prevents the client from using the tool until it can
+      prove that it read the best practices. While on, the six
+      best-practice write tools (automations, scripts, scenes, helpers,
+      dashboards, raw YAML) are blocked and return an error directing the
+      client to read the best-practices skill via ha_get_skill_guide and
+      pass back the acknowledgment key it obtains there. Child of the
+      "Attach best-practice skills on writes" option above and inert
+      while that parent is off. Requires restart to take effect.
   enable_filesystem_tools:
     name: Enable filesystem tools (beta)
     description: >-

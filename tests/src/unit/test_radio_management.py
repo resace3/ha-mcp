@@ -246,9 +246,9 @@ class TestManageRadioDispatcher:
         record: list = []
         client = _client(
             {
-                "config/entity_registry/list": {
+                "config/entity_registry/get": {
                     "success": True,
-                    "result": [{"entity_id": "light.m", "device_id": "m1"}],
+                    "result": {"entity_id": "light.m", "device_id": "m1"},
                 },
                 "matter/node_diagnostics": {"success": True, "result": _DIAG},
             },
@@ -257,6 +257,10 @@ class TestManageRadioDispatcher:
         radio = _capture(register_radio_tools, client)["ha_manage_radio"]
         out = await radio(radio="matter", action="diagnostics", entity_id="light.m")
         assert out["diagnostics"]["network_type"] == "THREAD"
+        # Resolution uses the targeted single-entity get, not a full-list pull.
+        reg = [m for m in record if m["type"] == "config/entity_registry/get"]
+        assert reg and reg[0]["entity_id"] == "light.m"
+        assert not any(m["type"] == "config/entity_registry/list" for m in record)
         diag = [m for m in record if m["type"] == "matter/node_diagnostics"]
         assert diag and diag[0]["device_id"] == "m1"
 
@@ -552,9 +556,12 @@ class TestRadioDispatcherContract:
 
     @pytest.mark.asyncio
     async def test_resolve_entity_device_not_found(self):
-        # An entity_id the registry doesn't contain -> ENTITY_NOT_FOUND.
+        # An entity_id the registry doesn't contain -> ENTITY_NOT_FOUND. The
+        # targeted get returns success=False for an unknown entity_id.
+        record: list = []
         client = _client(
-            {"config/entity_registry/list": {"success": True, "result": []}}
+            {"config/entity_registry/get": {"success": False, "error": "not_found"}},
+            record=record,
         )
         radio = _capture(register_radio_tools, client)["ha_manage_radio"]
         with pytest.raises(ToolError) as exc:
@@ -562,3 +569,26 @@ class TestRadioDispatcherContract:
         msg = str(exc.value)
         assert "light.ghost" in msg
         assert "not found" in msg.lower()
+        # Uses the targeted get keyed by the requested entity_id.
+        reg = [m for m in record if m["type"] == "config/entity_registry/get"]
+        assert reg and reg[0]["entity_id"] == "light.ghost"
+
+
+@pytest.mark.asyncio
+async def test_resolve_entity_device_connection_failure_not_entity_not_found():
+    """A transport-shaped registry-get failure must surface as a connection
+    error, never ENTITY_NOT_FOUND (issue #1832 review)."""
+    client = _client(
+        {
+            "config/entity_registry/get": {
+                "success": False,
+                "error": "Failed to connect to Home Assistant WebSocket",
+            }
+        },
+    )
+    radio = _capture(register_radio_tools, client)["ha_manage_radio"]
+    with pytest.raises(ToolError) as exc:
+        await radio(radio="matter", action="diagnostics", entity_id="light.real")
+    msg = str(exc.value)
+    assert "CONNECTION_FAILED" in msg
+    assert "ENTITY_NOT_FOUND" not in msg

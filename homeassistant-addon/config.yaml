@@ -1,8 +1,8 @@
-name: "Home Assistant MCP Server"
-description: "AI assistant integration for Home Assistant via Model Context Protocol (MCP)"
+name: "Home Assistant MCP Server - DAG Studio"
+description: "Private causal DAG tools for Home Assistant via MCP"
 version: "7.12.3"
-slug: "ha_mcp"
-url: "https://github.com/homeassistant-ai/ha-mcp"
+slug: "ha_mcp_dag"
+url: "https://github.com/resace3/ha-mcp"
 arch:
   - aarch64 # 64-bit ARM (Raspberry Pi 4+, modern ARM devices)
   - amd64 # 64-bit x86 (most PCs and servers)
@@ -22,6 +22,8 @@ boot: manual
 ingress: true
 ingress_port: 9583
 ingress_stream: true
+panel_admin: true
+apparmor: true
 # Enable access to Supervisor API for auto-discovery
 hassio_api: true
 # `manager` (not `default`) is required so the Supervisor token grants access
@@ -33,7 +35,7 @@ homeassistant_api: true
 # Enable host network mode for local network access
 host_network: true
 # Use pre-built Docker images
-image: "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}"
+image: "ghcr.io/resace3/ha-mcp-dag-addon"
 # Options for user configuration
 # NOTE: enable_yaml_config_editing (+ enable_yaml_packages_* and
 # enable_yaml_edit_confirm),
@@ -47,15 +49,18 @@ options:
   backup_hint: "normal"
   enable_tool_search: false
   tool_search_max_results: 5
-  enable_tool_security_policies: false
+  enable_tool_security_policies: true
   read_only_mode: false
   enable_mandatory_bps: true
+  enable_strict_mandatory_bps: true
   disabled_tools: ""
   pinned_tools: ""
   enable_auto_backup: true
   auto_backup_throttle_minutes: 0
   auto_backup_retain_per_entity: 100
   verify_ssl: true
+  enable_dag_studio: true
+  dag_studio_max_request_bytes: 1048576
 schema:
   backup_hint: list(strong|normal|weak|auto)
   secret_path: str?
@@ -64,12 +69,15 @@ schema:
   enable_tool_security_policies: bool?
   read_only_mode: bool?
   enable_mandatory_bps: bool?
+  enable_strict_mandatory_bps: bool?
   disabled_tools: str?
   pinned_tools: str?
   enable_auto_backup: bool?
   auto_backup_throttle_minutes: int(0,1440)?
   auto_backup_retain_per_entity: int(1,10000)?
   verify_ssl: bool?
+  enable_dag_studio: bool?
+  dag_studio_max_request_bytes: int(1024,10485760)?
 # Add-on exposes HTTP port for MCP communication (fixed internal port)
 ports:
   9583/tcp: 9583

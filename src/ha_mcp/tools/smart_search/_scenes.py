@@ -7,9 +7,10 @@ from typing import Any
 from ._config import (
     BULK_WEBSOCKET_TIMEOUT,
     INDIVIDUAL_CONFIG_TIMEOUT,
+    INDIVIDUAL_FETCH_BATCH_SIZE,
     SCENE_CONFIG_TIME_BUDGET,
 )
-from ._fetch import ConfigFetchMixin
+from ._fetch import ConfigFetchMixin, is_timeout_error
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,10 @@ class SceneSearchMixin(ConfigFetchMixin):
     """Scene config search (scenes lack a list primitive; per-id fetch + registry walk)."""
 
     async def _walk_scene_registry(
-        self, configs: dict[str, dict[str, Any]]
+        self,
+        configs: dict[str, dict[str, Any]],
+        *,
+        prefetched_registry: Any = None,
     ) -> tuple[set[str], dict[str, str], bool]:
         """Walk the entity registry once for scene metadata (Phase 2.5).
 
@@ -59,12 +63,19 @@ class SceneSearchMixin(ConfigFetchMixin):
         # scene the registry knows about regardless of bulk-fetch coverage.
         slug_to_storage_id: dict[str, str] = {}
         try:
-            reg_resp = await asyncio.wait_for(
-                self.client.send_websocket_message(
-                    {"type": "config/entity_registry/list"}
-                ),
-                timeout=BULK_WEBSOCKET_TIMEOUT,
-            )
+            # The ha_search orchestrator may hand us the registry list it already
+            # fetched for the entity branch (one list instead of two). A
+            # pre-fetched non-success payload flows through the same else-branch
+            # below → registry_failed=True, matching a self-fetched soft failure.
+            if prefetched_registry is not None:
+                reg_resp = prefetched_registry
+            else:
+                reg_resp = await asyncio.wait_for(
+                    self.client.send_websocket_message(
+                        {"type": "config/entity_registry/list"}
+                    ),
+                    timeout=BULK_WEBSOCKET_TIMEOUT,
+                )
             if isinstance(reg_resp, dict) and reg_resp.get("success"):
                 for entry in reg_resp.get("result") or []:
                     self._index_scene_registry_entry(
@@ -199,13 +210,16 @@ class SceneSearchMixin(ConfigFetchMixin):
         exact_match: bool,
         *,
         config_time_budget: float | None = None,
-    ) -> tuple[list[dict[str, Any]], int, int, int, bool]:
+        prefetched_registry: Any = None,
+    ) -> tuple[list[dict[str, Any]], int, int, int, bool, int]:
         """Deep-search scenes: 3-tier strategy plus registry-walk augmentation.
 
         Scenes have no listing primitive, so entities are enumerated from
         get_states() and configs fetched per id. Returns the scene results plus
-        the four signals that drive the response ``partial`` flag:
-        ``(results, failed_count, skipped_count, integration_skipped, registry_failed)``.
+        the five diagnostic signals feeding the response ``partial`` /
+        ``partial_reason``:
+        ``(results, failed_count, skipped_count, integration_skipped,
+        registry_failed, timeout_count)``.
         """
         scene_entities = [
             e for e in all_entities if e.get("entity_id", "").startswith("scene.")
@@ -243,11 +257,14 @@ class SceneSearchMixin(ConfigFetchMixin):
             homeassistant_scene_uids,
             slug_to_storage_id,
             registry_failed,
-        ) = await self._walk_scene_registry(configs)
+        ) = await self._walk_scene_registry(
+            configs, prefetched_registry=prefetched_registry
+        )
 
         failed_count = 0
         skipped_count = 0
         integration_skipped = 0
+        timeout_count = 0
 
         # Attempt C: parallel per-id fetch with a wall-clock budget so a few
         # slow scenes don't tank the whole search.
@@ -265,7 +282,24 @@ class SceneSearchMixin(ConfigFetchMixin):
                         timeout=INDIVIDUAL_CONFIG_TIMEOUT,
                     )
                     return (sid, config_resp.get("config", {}), None)
+                except TimeoutError:
+                    # Per-request timeout under batch concurrency — distinct
+                    # from a real failure; see _fetch_automation_config
+                    # (#1784).
+                    logger.debug(
+                        f"Scene individual config fetch ({sid}) timed out "
+                        f"after {INDIVIDUAL_CONFIG_TIMEOUT}s."
+                    )
+                    return (sid, None, "timeout")
                 except Exception as e:
+                    if is_timeout_error(e):
+                        # Client-side HTTP timeout arrived wrapped; still a
+                        # timeout. See is_timeout_error in _fetch.
+                        logger.debug(
+                            f"Scene individual config fetch ({sid}) timed "
+                            f"out (client-side HTTP timeout): {e}"
+                        )
+                        return (sid, None, "timeout")
                     logger.debug(f"Scene individual config fetch ({sid}) failed: {e}")
                     return (sid, None, "failed")
 
@@ -278,6 +312,7 @@ class SceneSearchMixin(ConfigFetchMixin):
                 # from `_individual_fetch_budgeted` is therefore expected
                 # to stay at zero on this path.
                 _scene_yaml_skipped,
+                timeout_count,
             ) = await self._individual_fetch_budgeted(
                 sids_to_fetch,
                 _fetch_scene_config,
@@ -312,6 +347,7 @@ class SceneSearchMixin(ConfigFetchMixin):
             skipped_count,
             integration_skipped,
             registry_failed,
+            timeout_count,
         )
 
     @staticmethod
@@ -333,7 +369,10 @@ class SceneSearchMixin(ConfigFetchMixin):
         """
         failed = scene_stats["failed"]
         skipped = scene_stats["skipped"]
-        if not (failed or skipped):
+        # .get(): tolerate older callers/tests that build the stats dict
+        # without the timeout key (added for #1784).
+        timeout = scene_stats.get("timeout", 0)
+        if not (failed or skipped or timeout):
             return
         response["partial"] = True
         reason_parts: list[str] = []
@@ -341,6 +380,18 @@ class SceneSearchMixin(ConfigFetchMixin):
             reason_parts.append(
                 f"{failed} scene(s) not scanned (per-id fetch raised) — "
                 "their match status is unknown; this result is not exhaustive."
+            )
+        if timeout:
+            reason_parts.append(
+                f"{timeout} scene(s) not scanned (per-id fetch timed out "
+                f"after {INDIVIDUAL_CONFIG_TIMEOUT}s while "
+                f"{INDIVIDUAL_FETCH_BATCH_SIZE} fetches ran concurrently — "
+                "this usually means the HA server serves config reads "
+                "serially, not that the scenes are broken) — their match "
+                "status is unknown; this result is not exhaustive. Lower "
+                "HAMCP_INDIVIDUAL_FETCH_BATCH_SIZE and/or raise "
+                "HAMCP_INDIVIDUAL_CONFIG_TIMEOUT (or the matching fields in "
+                "the web Settings UI's Advanced section)."
             )
         if skipped:
             reason_parts.append(

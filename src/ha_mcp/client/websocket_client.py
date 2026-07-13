@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 MAX_WS_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
+def _extract_ws_error(error: Any) -> tuple[str, str | None]:
+    """Split an HA WebSocket ``error`` payload into ``(message, code)``.
+
+    HA replies to a failed command with ``{"error": {"code": ..., "message":
+    ...}}``. Dict payloads yield both fields; a bare string (or other shape)
+    yields ``str(error)`` as the message and ``None`` for the code. The code is
+    threaded onto ``HomeAssistantCommandError`` so callers route on the stable
+    ``code`` (e.g. ``unknown_command``) instead of the message text.
+    """
+    if isinstance(error, dict):
+        return error.get("message", str(error)), error.get("code")
+    return str(error), None
+
+
 class WebSocketConnectionState:
     """Encapsulates mutable state used by the WebSocket client."""
 
@@ -632,13 +646,10 @@ class HomeAssistantWebSocketClient:
             # Process standard Home Assistant WebSocket response
             if response.get("type") == "result":
                 if response.get("success") is False:
-                    error = response.get("error", {})
-                    error_msg = (
-                        error.get("message", str(error))
-                        if isinstance(error, dict)
-                        else str(error)
+                    error_msg, error_code = _extract_ws_error(response.get("error", {}))
+                    raise HomeAssistantCommandError(
+                        f"Command failed: {error_msg}", error_code
                     )
-                    raise HomeAssistantCommandError(f"Command failed: {error_msg}")
 
                 # Return success response according to HA WebSocket format
                 return {
@@ -715,13 +726,8 @@ class HomeAssistantWebSocketClient:
 
         if not result_response.get("success"):
             self.cancel_event_response(message_id)
-            error = result_response.get("error", {})
-            error_msg = (
-                error.get("message", str(error))
-                if isinstance(error, dict)
-                else str(error)
-            )
-            raise HomeAssistantCommandError(f"Command failed: {error_msg}")
+            error_msg, error_code = _extract_ws_error(result_response.get("error", {}))
+            raise HomeAssistantCommandError(f"Command failed: {error_msg}", error_code)
 
         try:
             event_response = await asyncio.wait_for(event_future, timeout=wait_timeout)
@@ -787,11 +793,10 @@ class HomeAssistantWebSocketClient:
         if response.get("type") == "result" and response.get("success"):
             return message_id
 
-        error = response.get("error", {})
-        error_msg = (
-            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        error_msg, error_code = _extract_ws_error(response.get("error", {}))
+        raise HomeAssistantCommandError(
+            f"subscribe_events failed: {error_msg}", error_code
         )
-        raise HomeAssistantCommandError(f"subscribe_events failed: {error_msg}")
 
     async def unsubscribe_events(self, subscription_id: int) -> None:
         """Release a subscription previously returned by ``subscribe_events``.
@@ -885,12 +890,9 @@ class HomeAssistantWebSocketClient:
             return message_id, queue
 
         self._state.unregister_subscription_queue(message_id)
-        error = response.get("error", {})
-        error_msg = (
-            error.get("message", str(error)) if isinstance(error, dict) else str(error)
-        )
+        error_msg, error_code = _extract_ws_error(response.get("error", {}))
         raise HomeAssistantCommandError(
-            f"subscribe_command({command_type!r}) failed: {error_msg}"
+            f"subscribe_command({command_type!r}) failed: {error_msg}", error_code
         )
 
     async def unsubscribe_command(
@@ -1035,7 +1037,7 @@ class WebSocketManager:
     _current_loop: asyncio.AbstractEventLoop | None = None
     _lock: asyncio.Lock | None = None
     _lock_loop: asyncio.AbstractEventLoop | None = None
-    _client_factory: Callable[[str, str], HomeAssistantWebSocketClient] | None = None
+    _client_factory: Callable[..., HomeAssistantWebSocketClient] | None = None
 
     def __new__(cls) -> "WebSocketManager":
         if cls._instance is None:
@@ -1050,8 +1052,7 @@ class WebSocketManager:
     def configure(
         self,
         *,
-        client_factory: Callable[[str, str], HomeAssistantWebSocketClient]
-        | None = None,
+        client_factory: Callable[..., HomeAssistantWebSocketClient] | None = None,
     ) -> None:
         """Configure the manager with injectable dependencies."""
         if client_factory is not None:
@@ -1082,10 +1083,28 @@ class WebSocketManager:
         """Create a cache key from credentials."""
         return hashlib.sha256(f"{url.rstrip('/')}:{token}".encode()).hexdigest()
 
+    @staticmethod
+    def _effective_verify_ssl(verify_ssl: bool | None) -> bool:
+        """Resolve the effective TLS-verification mode for the pool key."""
+        if verify_ssl is not None:
+            return verify_ssl
+        try:
+            return bool(get_global_settings().verify_ssl)
+        except Exception as e:
+            # Mirror HomeAssistantWebSocketClient.__init__: a bad env var
+            # elsewhere should not crash pooling or silently flip TLS off.
+            logger.warning(
+                "Could not load settings while resolving the pool verify_ssl "
+                "key (%s); falling back to verify_ssl=True.",
+                e,
+            )
+            return True
+
     async def get_client(
         self,
         url: str | None = None,
         token: str | None = None,
+        verify_ssl: bool | None = None,
     ) -> HomeAssistantWebSocketClient:
         """Get WebSocket client, creating connection if needed.
 
@@ -1098,6 +1117,10 @@ class WebSocketManager:
                  credentials instead of global settings. This is required
                  for OAuth mode where each request has its own credentials.
             token: Optional HA token. Must be provided with url.
+            verify_ssl: TLS verification override, keyed into the pool so a
+                 ``HomeAssistantClient(verify_ssl=False)`` caller never shares
+                 a connection built with default verification. ``None`` keeps
+                 the client's own settings-based default.
         """
         current_loop = asyncio.get_event_loop()
 
@@ -1132,7 +1155,16 @@ class WebSocketManager:
                 ws_url = settings.homeassistant_url
                 ws_token = settings.homeassistant_token
 
-            key = self._client_key(ws_url, ws_token)
+            # Key on the EFFECTIVE verification mode: a caller passing the
+            # resolved settings default (send_websocket_message) must share
+            # the pooled connection with callers that omit the argument
+            # (listener, HACS, installer) — only a genuine override such as
+            # verify_ssl=False gets its own isolated connection.
+            effective_verify_ssl = self._effective_verify_ssl(verify_ssl)
+            key = (
+                f"{self._client_key(ws_url, ws_token)}"
+                f"|verify_ssl={effective_verify_ssl}"
+            )
 
             # Return existing connected client for these credentials
             existing = self._clients.get(key)
@@ -1146,7 +1178,11 @@ class WebSocketManager:
                 self._last_used.pop(key, None)
 
             factory = self._client_factory or HomeAssistantWebSocketClient
-            client = factory(ws_url, ws_token)
+            client = (
+                factory(ws_url, ws_token)
+                if verify_ssl is None
+                else factory(ws_url, ws_token, verify_ssl=verify_ssl)
+            )
 
             connected = await client.connect()
             if not connected:
@@ -1208,11 +1244,16 @@ websocket_manager = WebSocketManager()
 async def get_websocket_client(
     url: str | None = None,
     token: str | None = None,
+    verify_ssl: bool | None = None,
 ) -> HomeAssistantWebSocketClient:
     """Get the global WebSocket client instance.
 
     Args:
         url: Optional HA URL for per-client credentials (OAuth mode).
         token: Optional HA token for per-client credentials (OAuth mode).
+        verify_ssl: Optional TLS-verification override propagated into the
+            pool key and client construction (None = settings default).
     """
-    return await websocket_manager.get_client(url=url, token=token)
+    return await websocket_manager.get_client(
+        url=url, token=token, verify_ssl=verify_ssl
+    )

@@ -18,8 +18,10 @@ from ._config import (
     BULK_REST_TIMEOUT,
     DEFAULT_CONCURRENCY_LIMIT,
     INDIVIDUAL_CONFIG_TIMEOUT,
+    INDIVIDUAL_FETCH_BATCH_SIZE,
     SCRIPT_CONFIG_TIME_BUDGET,
 )
+from ._fetch import is_timeout_error
 from ._scenes import SceneSearchMixin
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,9 @@ class DeepSearchMixin(SceneSearchMixin):
         exact_match: bool = True,
         config_time_budget: float | None = None,
         ctx: Context | None = None,
+        *,
+        prefetched_states: list[dict[str, Any]] | None = None,
+        prefetched_registry: Any = None,
     ) -> dict[str, Any]:
         """
         Deep search across automation, script, scene, helper, and dashboard
@@ -56,6 +61,17 @@ class DeepSearchMixin(SceneSearchMixin):
             include_config: Include full config in results (default: False)
             concurrency_limit: Max concurrent API calls for config fetching
             exact_match: Use exact substring matching (default: True). Set False for fuzzy.
+            prefetched_states: Pre-fetched ``get_states()`` list shared by the
+                ha_search orchestrator when both search branches run; ``None``
+                means fetch here.
+            prefetched_registry: Pre-fetched ``config/entity_registry/list``
+                response threaded to the scene registry walk *and* the helper
+                name-staleness map. ``None`` means the scene walk fetches it
+                itself; the helper branch degrades to storage-name matching
+                (it never fetches the registry on its own — see
+                ``_deep_search_helpers``). The orchestrator only hands one down
+                when both the entity and config-body branches run, so direct
+                ``deep_search``/``ha_deep_search`` callers get ``None`` here.
 
         Returns:
             Dictionary with search results grouped by type
@@ -85,8 +101,14 @@ class DeepSearchMixin(SceneSearchMixin):
                 message="fetching entity states",
             )
 
-            # Fetch all entities once at the beginning to avoid repeated calls
-            all_entities = await self.client.get_states()
+            # Fetch all entities once at the beginning to avoid repeated calls.
+            # The ha_search orchestrator may hand us a snapshot it already fetched
+            # for the entity branch so the two branches share one /api/states.
+            all_entities = (
+                prefetched_states
+                if prefetched_states is not None
+                else await self.client.get_states()
+            )
             phase_done = 1
             await safe_progress(
                 ctx,
@@ -111,6 +133,7 @@ class DeepSearchMixin(SceneSearchMixin):
             scene_stats: dict[str, Any] = {
                 "failed": 0,
                 "skipped": 0,
+                "timeout": 0,
                 "integration_skipped": 0,
                 "registry_failed": False,
             }
@@ -120,13 +143,16 @@ class DeepSearchMixin(SceneSearchMixin):
             # surface as ``partial: True`` so callers can detect "incomplete
             # zero" / "incomplete partial" results vs a true complete answer.
             # ``_skipped`` = budget exhausted before fetch; ``_failed`` =
-            # fetch attempted but raised (caught at ``debug``-level).
+            # fetch attempted but raised (caught at ``debug``-level);
+            # ``_timeout`` = fetch exceeded the per-request timeout (#1784).
             automation_skipped = 0
             automation_failed = 0
             automation_yaml_skipped = 0
+            automation_timeout = 0
             script_skipped = 0
             script_failed = 0
             script_yaml_skipped = 0
+            script_timeout = 0
             helper_failed = 0
             dashboard_failed = 0
 
@@ -136,6 +162,7 @@ class DeepSearchMixin(SceneSearchMixin):
                     automation_skipped,
                     automation_failed,
                     automation_yaml_skipped,
+                    automation_timeout,
                 ) = await self._deep_search_automations(
                     all_entities,
                     automation_unique_id_map,
@@ -157,6 +184,7 @@ class DeepSearchMixin(SceneSearchMixin):
                     script_skipped,
                     script_failed,
                     script_yaml_skipped,
+                    script_timeout,
                 ) = await self._deep_search_scripts(
                     all_entities,
                     query_lower,
@@ -178,11 +206,13 @@ class DeepSearchMixin(SceneSearchMixin):
                     scene_stats["skipped"],
                     scene_stats["integration_skipped"],
                     scene_stats["registry_failed"],
+                    scene_stats["timeout"],
                 ) = await self._deep_search_scenes(
                     all_entities,
                     query_lower,
                     exact_match,
                     config_time_budget=config_time_budget,
+                    prefetched_registry=prefetched_registry,
                 )
                 phase_done += 1
                 await safe_progress(
@@ -197,7 +227,11 @@ class DeepSearchMixin(SceneSearchMixin):
                     results["helpers"],
                     helper_failed,
                 ) = await self._deep_search_helpers(
-                    query_lower, exact_match, semaphore, include_config
+                    query_lower,
+                    exact_match,
+                    semaphore,
+                    include_config,
+                    prefetched_registry=prefetched_registry,
                 )
                 phase_done += 1
                 await safe_progress(
@@ -233,9 +267,11 @@ class DeepSearchMixin(SceneSearchMixin):
                 automation_skipped=automation_skipped,
                 automation_failed=automation_failed,
                 automation_yaml_skipped=automation_yaml_skipped,
+                automation_timeout=automation_timeout,
                 script_skipped=script_skipped,
                 script_failed=script_failed,
                 script_yaml_skipped=script_yaml_skipped,
+                script_timeout=script_timeout,
                 helper_failed=helper_failed,
                 dashboard_failed=dashboard_failed,
             )
@@ -282,22 +318,26 @@ class DeepSearchMixin(SceneSearchMixin):
         exact_match: bool,
         *,
         config_time_budget: float | None = None,
-    ) -> tuple[list[dict[str, Any]], int, int, int]:
+    ) -> tuple[list[dict[str, Any]], int, int, int, int]:
         """Deep-search automations: 3-tier config fetch (REST bulk -> WS bulk -> individual).
 
-        Returns ``(matches, skipped_count, failed_count, yaml_skipped_count)``.
-        ``skipped_count`` is non-zero only when bulk fetch fell back to the
-        per-id Attempt-C path AND its wall-clock budget exhausted before all
-        configs were fetched; ``failed_count`` is non-zero when individual
-        config fetches raised a non-404 exception (caught at ``debug``-level);
-        ``yaml_skipped_count`` is non-zero when individual config fetches
-        returned 404, which is the documented HA behaviour for YAML-defined
-        automations (the ``/config/automation/config/<id>`` REST endpoint
-        only exposes UI-storage automations). All three surface as
-        ``partial: True`` in the response so callers can distinguish a
-        complete zero-result from an incomplete one — skipped/failed ids
-        carry their score-without-config through the merge and fall below
-        the match threshold silently otherwise.
+        Returns ``(matches, skipped_count, failed_count, yaml_skipped_count,
+        timeout_count)``. ``skipped_count`` is non-zero only when bulk fetch
+        fell back to the per-id Attempt-C path AND its wall-clock budget
+        exhausted before all configs were fetched; ``failed_count`` is
+        non-zero when individual config fetches raised a non-404, non-timeout
+        exception (caught at ``debug``-level); ``yaml_skipped_count`` is
+        non-zero when individual config fetches returned 404, which is the
+        documented HA behaviour for YAML-defined automations (the
+        ``/config/automation/config/<id>`` REST endpoint only exposes
+        UI-storage automations); ``timeout_count`` is non-zero when fetches
+        exceeded the per-request ``INDIVIDUAL_CONFIG_TIMEOUT`` — usually a
+        sign the HA server serves config reads serially and the concurrent
+        batch queued past the timeout, not that anything is broken (#1784).
+        All four surface as ``partial: True`` in the response so callers can
+        distinguish a complete zero-result from an incomplete one —
+        skipped/failed ids carry their score-without-config through the
+        merge and fall below the match threshold silently otherwise.
         """
         automation_entities = [
             e for e in all_entities if e.get("entity_id", "").startswith("automation.")
@@ -334,6 +374,9 @@ class DeepSearchMixin(SceneSearchMixin):
 
         # Attempt C: parallel individual REST calls with time budget (LAST RESORT)
         skipped_count = 0
+        failed_count = 0
+        yaml_skipped_count = 0
+        timeout_count = 0
         if not bulk_fetched:
             uids_to_fetch = [
                 uid for _, _, uid, _ in scored if uid and uid not in configs
@@ -364,7 +407,27 @@ class DeepSearchMixin(SceneSearchMixin):
                         f"Automation individual config fetch ({uid}) failed: {e}"
                     )
                     return (uid, None, "failed")
+                except TimeoutError:
+                    # asyncio.wait_for hit INDIVIDUAL_CONFIG_TIMEOUT. Classify
+                    # distinctly from "failed": on servers that serialize
+                    # config reads, a batch's tail requests queue past the
+                    # timeout while still perfectly healthy (#1784).
+                    logger.debug(
+                        f"Automation individual config fetch ({uid}) timed "
+                        f"out after {INDIVIDUAL_CONFIG_TIMEOUT}s."
+                    )
+                    return (uid, None, "timeout")
                 except Exception as e:
+                    if is_timeout_error(e):
+                        # The REST client's own httpx timeout (HA_TIMEOUT)
+                        # fired first and arrived wrapped in a
+                        # HomeAssistantConnectionError — still a timeout,
+                        # not a failure. See is_timeout_error.
+                        logger.debug(
+                            f"Automation individual config fetch ({uid}) "
+                            f"timed out (client-side HTTP timeout): {e}"
+                        )
+                        return (uid, None, "timeout")
                     logger.debug(
                         f"Automation individual config fetch ({uid}) failed: {e}"
                     )
@@ -375,6 +438,7 @@ class DeepSearchMixin(SceneSearchMixin):
                 failed_count,
                 skipped_count,
                 yaml_skipped_count,
+                timeout_count,
             ) = await self._individual_fetch_budgeted(
                 uids_to_fetch,
                 _fetch_automation_config,
@@ -385,9 +449,6 @@ class DeepSearchMixin(SceneSearchMixin):
                 "automations",
             )
             configs.update(fetched_configs)
-        else:
-            failed_count = 0
-            yaml_skipped_count = 0
 
         # Phase 3: Score with whatever configs we have
         matches = [
@@ -403,7 +464,7 @@ class DeepSearchMixin(SceneSearchMixin):
                 scored, configs, query_lower, exact_match
             )
         ]
-        return matches, skipped_count, failed_count, yaml_skipped_count
+        return matches, skipped_count, failed_count, yaml_skipped_count, timeout_count
 
     async def _deep_search_scripts(
         self,
@@ -412,13 +473,14 @@ class DeepSearchMixin(SceneSearchMixin):
         exact_match: bool,
         *,
         config_time_budget: float | None = None,
-    ) -> tuple[list[dict[str, Any]], int, int, int]:
+    ) -> tuple[list[dict[str, Any]], int, int, int, int]:
         """Deep-search scripts: same 3-tier strategy as automations.
 
-        Returns ``(matches, skipped_count, failed_count, yaml_skipped_count)``;
-        semantics identical to ``_deep_search_automations`` — the 404 path
-        catches YAML-defined scripts (which ``client.get_script_config``
-        re-raises as ``HomeAssistantAPIError(status_code=404)``).
+        Returns ``(matches, skipped_count, failed_count, yaml_skipped_count,
+        timeout_count)``; semantics identical to ``_deep_search_automations``
+        — the 404 path catches YAML-defined scripts (which
+        ``client.get_script_config`` re-raises as
+        ``HomeAssistantAPIError(status_code=404)``).
         """
         script_entities = [
             e for e in all_entities if e.get("entity_id", "").startswith("script.")
@@ -451,6 +513,9 @@ class DeepSearchMixin(SceneSearchMixin):
 
         # Attempt C: parallel individual fetch with budget (see #879)
         skipped_count = 0
+        failed_count = 0
+        yaml_skipped_count = 0
+        timeout_count = 0
         if not bulk_fetched:
             sids_to_fetch = [
                 sid for _, _, sid, _ in scored if sid and sid not in configs
@@ -478,7 +543,23 @@ class DeepSearchMixin(SceneSearchMixin):
                         return (sid, None, "yaml_skipped")
                     logger.debug(f"Script individual config fetch ({sid}) failed: {e}")
                     return (sid, None, "failed")
+                except TimeoutError:
+                    # See _fetch_automation_config: per-request timeout under
+                    # batch concurrency, distinct from a real failure (#1784).
+                    logger.debug(
+                        f"Script individual config fetch ({sid}) timed out "
+                        f"after {INDIVIDUAL_CONFIG_TIMEOUT}s."
+                    )
+                    return (sid, None, "timeout")
                 except Exception as e:
+                    if is_timeout_error(e):
+                        # Client-side HTTP timeout arrived wrapped; still a
+                        # timeout. See _fetch_automation_config.
+                        logger.debug(
+                            f"Script individual config fetch ({sid}) timed "
+                            f"out (client-side HTTP timeout): {e}"
+                        )
+                        return (sid, None, "timeout")
                     logger.debug(f"Script individual config fetch ({sid}) failed: {e}")
                     return (sid, None, "failed")
 
@@ -487,6 +568,7 @@ class DeepSearchMixin(SceneSearchMixin):
                 failed_count,
                 skipped_count,
                 yaml_skipped_count,
+                timeout_count,
             ) = await self._individual_fetch_budgeted(
                 sids_to_fetch,
                 _fetch_script_config,
@@ -497,9 +579,6 @@ class DeepSearchMixin(SceneSearchMixin):
                 "scripts",
             )
             configs.update(fetched_configs)
-        else:
-            failed_count = 0
-            yaml_skipped_count = 0
 
         # Phase 3: Score scripts
         matches = [
@@ -516,7 +595,49 @@ class DeepSearchMixin(SceneSearchMixin):
                 scored, configs, query_lower, exact_match
             )
         ]
-        return matches, skipped_count, failed_count, yaml_skipped_count
+        return matches, skipped_count, failed_count, yaml_skipped_count, timeout_count
+
+    @staticmethod
+    def _build_helper_registry_map(
+        prefetched_registry: Any,
+        helper_types: set[str],
+    ) -> dict[str, tuple[str, str | None]]:
+        """Map each input_* helper's storage ``unique_id`` to current ``(entity_id, name)``.
+
+        Derived from the entity-registry snapshot the ha_search orchestrator
+        already fetched — never fetched here, so the helper branch adds no
+        request (see ``_deep_search_helpers``). A UI rename updates only the
+        entity registry, so this lets helper scoring match a helper's CURRENT
+        entity_id and name while the ``<type>/list`` storage record still
+        carries its creation-time slug/name (issue #1794). For a storage helper
+        the registry ``unique_id`` equals the ``<type>/list`` record ``id`` and
+        ``platform`` equals the helper domain (e.g. ``input_boolean``); the
+        current name is the registry ``name`` (user override) falling back to
+        ``original_name`` — left ``None`` when both are absent so the caller
+        keeps the storage name. Entries with no usable ``unique_id`` /
+        ``entity_id``, a non-input_* platform, or a non-dict shape are skipped.
+
+        Returns ``{}`` when no snapshot was handed down (direct ``deep_search``
+        callers) or the snapshot is a soft failure — the caller then degrades
+        to storage-name-only matching.
+        """
+        if not (
+            isinstance(prefetched_registry, dict) and prefetched_registry.get("success")
+        ):
+            return {}
+        out: dict[str, tuple[str, str | None]] = {}
+        for entry in prefetched_registry.get("result") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("platform") not in helper_types:
+                continue
+            uid = entry.get("unique_id")
+            entity_id = entry.get("entity_id")
+            if not uid or not entity_id:
+                continue
+            current_name = entry.get("name") or entry.get("original_name")
+            out[uid] = (entity_id, current_name)
+        return out
 
     async def _search_helper_type(
         self,
@@ -524,6 +645,8 @@ class DeepSearchMixin(SceneSearchMixin):
         query_lower: str,
         exact_match: bool,
         semaphore: asyncio.Semaphore,
+        *,
+        registry_by_uid: dict[str, tuple[str, str | None]] | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         """Fetch one input_* helper type via WS list and return query matches.
 
@@ -535,7 +658,20 @@ class DeepSearchMixin(SceneSearchMixin):
         swallowed to an empty list: otherwise the caller cannot tell a real
         zero-match from a partial backend outage (helpers run on every
         default ``ha_search`` call).
+
+        ``registry_by_uid`` maps a helper's storage ``unique_id`` to its
+        CURRENT ``(entity_id, name)`` from the entity registry (built by
+        ``_deep_search_helpers`` from the orchestrator's registry snapshot). A
+        UI rename updates only the registry, so the ``<type>/list`` record
+        still carries the creation-time entity_id slug and name (issue #1794);
+        when the map has an entry we score and emit the current values so a
+        search for the renamed name/entity_id matches. The storage name is
+        still scored (and the storage body still searched below), so config
+        references and un-renamed helpers never regress. ``None`` (direct
+        ``deep_search`` callers with no snapshot) degrades to the storage
+        values — today's behaviour.
         """
+        registry_by_uid = registry_by_uid or {}
         async with semaphore:
             try:
                 resp = await self.client.send_websocket_message(
@@ -551,18 +687,32 @@ class DeepSearchMixin(SceneSearchMixin):
                 matches: list[dict[str, Any]] = []
                 for helper in resp.get("result", []):
                     helper_id = helper.get("id", "")
-                    entity_id = f"{helper_type}.{helper_id}"
-                    name = helper.get("name", helper_id)
+                    storage_name = helper.get("name", helper_id)
+                    # Prefer the registry's CURRENT entity_id + name after a UI
+                    # rename; fall back to the storage-derived values when this
+                    # helper isn't in the snapshot (or no snapshot was handed
+                    # down at all).
+                    reg_entity_id, reg_name = registry_by_uid.get(
+                        helper_id, (None, None)
+                    )
+                    entity_id = reg_entity_id or f"{helper_type}.{helper_id}"
+                    display_name = reg_name or storage_name
 
-                    name_match_score = self.fuzzy_searcher._calculate_entity_score(
-                        entity_id, name, helper_type, query_lower
+                    # Score the query against every name the helper answers to —
+                    # its current (registry) name and its storage name — so
+                    # neither the rename nor the pre-rename value can hide it.
+                    name_match_score = max(
+                        self.fuzzy_searcher._calculate_entity_score(
+                            entity_id, candidate, helper_type, query_lower
+                        )
+                        for candidate in {display_name, storage_name}
                     )
                     config_match_score = self._search_in_dict(
                         helper, query_lower, exact_match
                     )
                     total_score, threshold, match_in_name = self._score_deep_match(
                         entity_id,
-                        name,
+                        display_name,
                         name_match_score,
                         config_match_score,
                         query_lower,
@@ -574,7 +724,7 @@ class DeepSearchMixin(SceneSearchMixin):
                             {
                                 "entity_id": entity_id,
                                 "helper_type": helper_type,
-                                "name": name,
+                                "name": display_name,
                                 "score": total_score,
                                 "match_in_name": match_in_name,
                                 "match_in_config": config_match_score >= threshold,
@@ -592,6 +742,8 @@ class DeepSearchMixin(SceneSearchMixin):
         exact_match: bool,
         semaphore: asyncio.Semaphore,
         include_config: bool,
+        *,
+        prefetched_registry: Any = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Deep-search helpers: parallel input_* WS lists plus flow-based helpers.
 
@@ -608,6 +760,14 @@ class DeepSearchMixin(SceneSearchMixin):
         ``ha_search`` call, so silent failures here mean the caller cannot
         tell "no helpers match" from "helper backend partially down" —
         surfaced via ``partial: True``.
+
+        ``prefetched_registry`` is the orchestrator's already-fetched
+        ``config/entity_registry/list`` response, reused (never re-fetched
+        here — this path adds no request) to map each input_* helper's storage
+        ``unique_id`` to its CURRENT entity_id + name so a UI rename doesn't
+        hide the helper from a search for its new name (#1794). ``None`` on the
+        direct ``deep_search``/``ha_deep_search`` path yields an empty map and
+        storage-name-only matching.
         """
         helper_types = [
             "input_boolean",
@@ -618,11 +778,21 @@ class DeepSearchMixin(SceneSearchMixin):
             "input_button",
         ]
 
+        registry_by_uid = self._build_helper_registry_map(
+            prefetched_registry, set(helper_types)
+        )
+
         results: list[dict[str, Any]] = []
         failed_type_count = 0
         type_results = await asyncio.gather(
             *[
-                self._search_helper_type(ht, query_lower, exact_match, semaphore)
+                self._search_helper_type(
+                    ht,
+                    query_lower,
+                    exact_match,
+                    semaphore,
+                    registry_by_uid=registry_by_uid,
+                )
                 for ht in helper_types
             ],
             return_exceptions=True,
@@ -796,6 +966,8 @@ class DeepSearchMixin(SceneSearchMixin):
         script_failed: int = 0,
         automation_yaml_skipped: int = 0,
         script_yaml_skipped: int = 0,
+        automation_timeout: int = 0,
+        script_timeout: int = 0,
         helper_failed: int = 0,
         dashboard_failed: int = 0,
     ) -> dict[str, Any]:
@@ -856,6 +1028,8 @@ class DeepSearchMixin(SceneSearchMixin):
             script_failed=script_failed,
             automation_yaml_skipped=automation_yaml_skipped,
             script_yaml_skipped=script_yaml_skipped,
+            automation_timeout=automation_timeout,
+            script_timeout=script_timeout,
             helper_failed=helper_failed,
             dashboard_failed=dashboard_failed,
         )
@@ -871,18 +1045,25 @@ class DeepSearchMixin(SceneSearchMixin):
         script_failed: int = 0,
         automation_yaml_skipped: int = 0,
         script_yaml_skipped: int = 0,
+        automation_timeout: int = 0,
+        script_timeout: int = 0,
         helper_failed: int = 0,
         dashboard_failed: int = 0,
     ) -> None:
         """Set ``partial: True`` when the deep-search per-type fetch path lost
         data — either the Attempt-C wall-clock budget exhausted
-        (``*_skipped``), individual fetches raised non-404 exceptions
-        (``*_failed``, caught at ``debug``-level so they would otherwise
-        be silent), or individual fetches returned 404 because the entity
-        is YAML-defined (``*_yaml_skipped``). ``helper_failed`` /
-        ``dashboard_failed`` cover the helper- and dashboard-list/config
-        backends, whose per-unit ``except`` blocks would otherwise swallow a
-        backend outage to an empty list with no signal.
+        (``*_skipped``), individual fetches raised non-404 non-timeout
+        exceptions (``*_failed``, caught at ``debug``-level so they would
+        otherwise be silent), individual fetches returned 404 because the
+        entity is YAML-defined (``*_yaml_skipped``), or individual fetches
+        exceeded the per-request timeout (``*_timeout`` — on servers that
+        serialize config reads a concurrent batch's tail queues past the
+        timeout while perfectly healthy, so the wording points at the
+        batch-size/timeout knobs rather than at the entities, #1784).
+        ``helper_failed`` / ``dashboard_failed`` cover the helper- and
+        dashboard-list/config backends, whose per-unit ``except`` blocks
+        would otherwise swallow a backend outage to an empty list with no
+        signal.
 
         Mirrors ``_apply_scene_partial_flag`` 's "looks complete when it
         isn't" coverage onto the automation/script/helper/dashboard paths —
@@ -902,52 +1083,64 @@ class DeepSearchMixin(SceneSearchMixin):
         and the new reasons are concatenated with ``" ; "``.
         """
         reasons: list[str] = []
-        if automation_skipped:
-            reasons.append(
-                f"{automation_skipped} automation(s) not scanned (time budget "
-                "exhausted) — their match status is unknown; this result is "
-                "not exhaustive. Pass `config_time_budget=` on `ha_search` to "
-                "raise the per-call limit (or, for the default, set "
-                "HAMCP_AUTOMATION_CONFIG_TIME_BUDGET or the matching field in "
-                "the web Settings UI's Advanced section)."
-            )
-        if automation_failed:
-            reasons.append(
-                f"{automation_failed} automation(s) not scanned (per-id fetch "
-                "raised a non-404 error) — their match status is unknown; "
-                "this result is not exhaustive."
-            )
-        if automation_yaml_skipped:
-            reasons.append(
-                f"{automation_yaml_skipped} automation(s) not scanned "
-                "(per-id config endpoint returned 404 — these are likely "
-                "YAML-defined automations that the /config/automation/config "
-                "REST endpoint does not expose) — their match status is "
-                "unknown; this result is not exhaustive."
-            )
-        if script_skipped:
-            reasons.append(
-                f"{script_skipped} script(s) not scanned (time budget "
-                "exhausted) — their match status is unknown; this result is "
-                "not exhaustive. Pass `config_time_budget=` on `ha_search` to "
-                "raise the per-call limit (or, for the default, set "
-                "HAMCP_SCRIPT_CONFIG_TIME_BUDGET or the matching field in "
-                "the web Settings UI's Advanced section)."
-            )
-        if script_failed:
-            reasons.append(
-                f"{script_failed} script(s) not scanned (per-id fetch raised "
-                "a non-404 error) — their match status is unknown; this "
-                "result is not exhaustive."
-            )
-        if script_yaml_skipped:
-            reasons.append(
-                f"{script_yaml_skipped} script(s) not scanned (per-id config "
-                "endpoint returned 404 — these are likely YAML-defined "
-                "scripts that the /config/script/config REST endpoint does "
-                "not expose) — their match status is unknown; this result "
-                "is not exhaustive."
-            )
+        # The automation and script fragments are symmetric (noun, per-id
+        # endpoint, budget env var); loop rather than duplicating the four
+        # per-class fragments per type.
+        for noun, endpoint, budget_env, skipped, failed, yaml_skipped, timeout in (
+            (
+                "automation",
+                "/config/automation/config",
+                "HAMCP_AUTOMATION_CONFIG_TIME_BUDGET",
+                automation_skipped,
+                automation_failed,
+                automation_yaml_skipped,
+                automation_timeout,
+            ),
+            (
+                "script",
+                "/config/script/config",
+                "HAMCP_SCRIPT_CONFIG_TIME_BUDGET",
+                script_skipped,
+                script_failed,
+                script_yaml_skipped,
+                script_timeout,
+            ),
+        ):
+            if skipped:
+                reasons.append(
+                    f"{skipped} {noun}(s) not scanned (time budget "
+                    "exhausted) — their match status is unknown; this result "
+                    "is not exhaustive. Pass `config_time_budget=` on "
+                    "`ha_search` to raise the per-call limit (or, for the "
+                    f"default, set {budget_env} or the matching field in "
+                    "the web Settings UI's Advanced section)."
+                )
+            if failed:
+                reasons.append(
+                    f"{failed} {noun}(s) not scanned (per-id fetch raised "
+                    "a non-404 error) — their match status is unknown; this "
+                    "result is not exhaustive."
+                )
+            if yaml_skipped:
+                reasons.append(
+                    f"{yaml_skipped} {noun}(s) not scanned (per-id config "
+                    "endpoint returned 404 — these are likely YAML-defined "
+                    f"{noun}s that the {endpoint} REST endpoint does not "
+                    "expose) — their match status is unknown; this result "
+                    "is not exhaustive."
+                )
+            if timeout:
+                reasons.append(
+                    f"{timeout} {noun}(s) not scanned (per-id fetch timed "
+                    f"out after {INDIVIDUAL_CONFIG_TIMEOUT}s while "
+                    f"{INDIVIDUAL_FETCH_BATCH_SIZE} fetches ran concurrently "
+                    "— this usually means the HA server serves config reads "
+                    f"serially, not that the {noun}s are broken) — their "
+                    "match status is unknown; this result is not exhaustive. "
+                    "Lower HAMCP_INDIVIDUAL_FETCH_BATCH_SIZE and/or raise "
+                    "HAMCP_INDIVIDUAL_CONFIG_TIMEOUT (or the matching fields "
+                    "in the web Settings UI's Advanced section)."
+                )
         if helper_failed:
             reasons.append(
                 f"{helper_failed} helper backend(s) not scanned (per-type list, "

@@ -33,7 +33,7 @@ dependencies = [
     "pydantic==2.13.4",
     "python-dotenv==1.2.2",
     "truststore==0.10.4",
-    "websockets==16.0",
+    "websockets==16.1",
     # Range (not a hard pin) so the resolver can satisfy Home Assistant's own
     # cryptography constraint when ha-mcp is installed into the HA venv for
     # in-process embedding (HA 2026.6 pins cryptography==48.0.0, 2026.7 pins
@@ -58,13 +58,14 @@ hamcp-test-env = "tests.test_env_manager:main"
 ha-mcp-web = "ha_mcp.__main__:main_web"
 ha-mcp-sse = "ha_mcp.__main__:main_sse"
 ha-mcp-oauth = "ha_mcp.__main__:main_oauth"
+ha-mcp-dag-studio = "ha_mcp.dag_studio.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src", "tests" = "tests"}
 packages = { find = { where = ["src", "."], include = ["ha_mcp*", "tests"] } }
 
 [tool.setuptools.package-data]
-ha_mcp = ["py.typed", "_pypi_marker", "settings_ui/settings.html", "settings_ui/settings.js", "settings_ui/settings.css", "resources/skills-vendor/**/*"]
+ha_mcp = ["py.typed", "_pypi_marker", "settings_ui/settings.html", "settings_ui/settings.js", "settings_ui/settings.css", "dag_studio/web/static/*", "resources/skills-vendor/**/*"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -102,6 +103,9 @@ module = [
     "awesomeversion",
     "yarl",
     "voluptuous",
+    # Ships with HA core at runtime (helpers.llm schema conversion, #1745);
+    # not installed in this dev environment.
+    "voluptuous_openapi",
     "jsonschema",
     "requests",
     "requests.*",
@@ -172,9 +176,7 @@ ignore = [
 "packaging/mcpb/generate_manifest.py" = ["C901"]
 "scripts/extract_tools.py" = ["C901"]
 "src/ha_mcp/backup_manager.py" = ["C901"]
-"src/ha_mcp/client/rest_client.py" = ["C901"]
 "src/ha_mcp/config.py" = ["C901"]
-"src/ha_mcp/policy/evaluator.py" = ["C901"]
 "src/ha_mcp/policy/handlers.py" = ["C901"]
 "src/ha_mcp/server.py" = ["C901"]
 "src/ha_mcp/settings_ui/__init__.py" = ["C901"]
@@ -184,7 +186,6 @@ ignore = [
 "src/ha_mcp/tools/radio/zigbee.py" = ["C901"]
 "src/ha_mcp/tools/radio/zwave.py" = ["C901"]
 "src/ha_mcp/tools/reference_validator.py" = ["C901"]
-"src/ha_mcp/tools/tools_addons.py" = ["C901"]
 "src/ha_mcp/tools/tools_areas.py" = ["C901"]
 "src/ha_mcp/tools/tools_code.py" = ["C901"]
 "src/ha_mcp/tools/tools_config_automations.py" = ["C901"]
@@ -192,18 +193,13 @@ ignore = [
 "src/ha_mcp/tools/tools_config_scripts.py" = ["C901"]
 "src/ha_mcp/tools/tools_dev.py" = ["C901"]
 "src/ha_mcp/tools/tools_energy.py" = ["C901"]
-"src/ha_mcp/tools/tools_hacs.py" = ["C901"]
 "src/ha_mcp/tools/tools_history.py" = ["C901"]
 "src/ha_mcp/tools/tools_integrations.py" = ["C901"]
 "src/ha_mcp/tools/tools_system.py" = ["C901"]
-"src/ha_mcp/tools/tools_traces.py" = ["C901"]
-"src/ha_mcp/tools/tools_updates.py" = ["C901"]
 "src/ha_mcp/tools/tools_yaml_config.py" = ["C901"]
 "src/ha_mcp/tools/tools_zones.py" = ["C901"]
 "src/ha_mcp/transforms/categorized_search.py" = ["C901"]
-"src/ha_mcp/utils/data_paths.py" = ["C901"]
 "src/ha_mcp/utils/fuzzy_search.py" = ["C901"]
-"src/ha_mcp/utils/skill_loader.py" = ["C901"]
 "src/ha_mcp/visibility/resolver.py" = ["C901"]
 "tests/src/e2e/conftest.py" = ["C901"]
 "tests/src/e2e/error_handling/test_network_errors.py" = ["C901"]
@@ -273,6 +269,10 @@ dev = [
     # Real voluptuous for the config-flow tests (the component's
     # config_flow imports it; HA provides it at runtime, tests need it here).
     "voluptuous>=0.15.2",
+    # Real voluptuous-openapi for the embedded e2e LLM-API test: it converts
+    # the REAL tool-schema catalog exactly like llm_api.py does at runtime
+    # (HA core provides it at runtime; unit tests stub it).
+    "voluptuous-openapi>=0.4.1",
     "pytest-xdist>=3.8.0",
     "requests>=2.25.0",
     "lefthook>=1.10.0",

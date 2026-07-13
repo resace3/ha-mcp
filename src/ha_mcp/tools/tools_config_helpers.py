@@ -10,17 +10,30 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, NoReturn, TypedDict
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import tool
 from pydantic import AliasChoices, Field
 
-from ..client.rest_client import HomeAssistantAPIError
+from ..client.rest_client import (
+    HomeAssistantAPIError,
+    HomeAssistantCommandError,
+    HomeAssistantCommandTimeout,
+)
+from ..client.websocket_client import get_websocket_client
 from ..errors import ErrorCode, create_error_response
+from ..strict_bps import BestPracticeKeyParam
 from .auto_backup import with_auto_backup
+from .component_api import (
+    component_supports,
+    get_component_caps,
+    invalidate_caps,
+    is_unknown_command,
+)
 from .config_entry_flow import (
     FLOW_HELPER_TYPES,
+    SUPPORTED_HELPERS,
     create_flow_helper,
     fetch_helper_flow_info,
     get_user_step_field_names,
@@ -1386,6 +1399,85 @@ async def _find_collision_in_simple_helpers(
     return None
 
 
+_REGISTRY_JOIN_STALE_WARNING = (
+    "Could not read the entity registry, so a renamed helper's 'name' may be the "
+    "creation-time name and no current 'entity_id' is shown; use ha_search to find "
+    "the helper by name for the authoritative current values."
+)
+
+
+async def _enrich_helpers_with_current_registry(
+    client: Any, helper_type: str, items: list[Any]
+) -> list[str]:
+    """Join the entity registry onto storage-collection helper records.
+
+    The ``{helper_type}/list`` response carries the immutable storage ``id``
+    (the unique_id) and the creation-time ``name``; after a UI rename the
+    current ``entity_id`` and display name live only in the entity registry, so
+    the raw list goes stale (issue #1794). For each record matched by
+    ``unique_id`` **and** ``platform == helper_type`` this adds the current
+    ``entity_id``, moves the storage name to ``original_name``, and sets
+    ``name`` to the current display name (registry ``name``, falling back to
+    ``original_name``). ``items`` is mutated in place.
+
+    Storage types without a matching entity (e.g. ``tag``) and platform
+    mismatches are left untouched. Returns a warnings list — non-empty only
+    when the registry read failed, so the caller can flag the un-enriched
+    result instead of silently returning stale values.
+    """
+    if not items:
+        # Nothing to enrich — skip the full-registry fetch entirely.
+        return []
+    # Degrade-open: enrichment is cosmetic, so any failure — the registry read,
+    # an unexpected registry shape (e.g. a non-hashable ``id`` breaking the
+    # lookup), or a malformed response — flags the result rather than raising
+    # out and letting the caller's handler turn a list call into a failure.
+    # Mirrors _get_entities_for_config_entry, which reads the same endpoint.
+    # send_websocket_message returns {"success": false, ...} instead of raising,
+    # so the malformed-response check below is the branch production takes.
+    try:
+        reg_result = await client.send_websocket_message(
+            {"type": "config/entity_registry/list"}
+        )
+        # A missing / non-list ``result`` (or a non-dict / unsuccessful response)
+        # is a malformed read, not an empty registry — flag it rather than
+        # silently returning un-enriched records. A present-but-empty ``[]`` is a
+        # legitimate no-match and passes through below without a warning.
+        if not (
+            isinstance(reg_result, dict)
+            and reg_result.get("success")
+            and isinstance(reg_result.get("result"), list)
+        ):
+            logger.debug(
+                "list_helpers registry enrichment: malformed registry response: %r",
+                reg_result,
+            )
+            return [_REGISTRY_JOIN_STALE_WARNING]
+        registry = reg_result["result"]
+        reg_by_uid = {
+            entry["unique_id"]: entry
+            for entry in registry
+            if isinstance(entry, dict)
+            and entry.get("platform") == helper_type
+            and entry.get("unique_id")
+        }
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = reg_by_uid.get(item.get("id"))
+            if entry is None:
+                continue
+            item["entity_id"] = entry.get("entity_id")
+            item["original_name"] = item.get("name")
+            item["name"] = (
+                entry.get("name") or entry.get("original_name") or item.get("name")
+            )
+    except Exception as e:
+        logger.debug(f"list_helpers registry enrichment failed: {e}")
+        return [_REGISTRY_JOIN_STALE_WARNING]
+    return []
+
+
 async def _check_name_collision(
     client: Any,
     helper_type: str,
@@ -1968,6 +2060,7 @@ async def _handle_flow_helper(
     entry_id = flow_result.get("entry_id")
     title = flow_result.get("title")
     warnings = list(pre_warnings)
+    warnings.extend(flow_result.get("warnings", []))
     entities, wait_warnings = await _wait_for_flow_entities(
         client, entry_id, action, wait
     )
@@ -3348,6 +3441,163 @@ def _validate_pre_dispatch_params(
 # ---------------------------------------------------------------------------
 
 
+def _shape_collection_helper_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map one component collection-helper record onto the legacy list record.
+
+    The legacy ``{helper_type}/list`` record is the storage body itself
+    (``id`` = storage id, ``name`` = creation-time name, plus type-specific
+    keys). The component supplies that same body as ``config`` and, from the
+    real storage collection + entity registry, the authoritative
+    ``storage_id`` plus the current ``entity_id`` and display ``name``. Keep the
+    legacy keys with their legacy meanings and layer the current ``entity_id`` +
+    ``name`` on top — the additive form of the #1794 stale-id fix that the
+    legacy-path PR converges to.
+    """
+    config = rec.get("config")
+    out: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
+    # Prefer the record-level ``storage_id`` (the component reads it from the
+    # real storage collection). Not every collection body carries its own
+    # ``id`` — person/zone are stored keyed by id rather than embedding it — so
+    # trusting the body's ``id`` drifts for those types. Fall back to
+    # ``object_id`` only when ``storage_id`` is absent (older component).
+    storage_id = rec.get("storage_id")
+    if storage_id is None:
+        storage_id = rec.get("object_id")
+    if storage_id is not None:
+        out["id"] = storage_id
+    entity_id = rec.get("entity_id")
+    if entity_id is not None:
+        out["entity_id"] = entity_id
+    name = rec.get("name")
+    if name is not None:
+        # The storage body's ``name`` is the creation-time name (a rename
+        # updates the registry, not the body — #1794); preserve it as
+        # ``original_name`` before the current display name overrides it, so a
+        # component-served record carries the same additive shape as the legacy
+        # join (both paths promise entity_id/original_name in the docstring).
+        original_name = out.get("name")
+        if original_name is not None:
+            out["original_name"] = original_name
+        out["name"] = name
+    return out
+
+
+def _shape_flow_helper_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map one component flow-helper record onto a list record.
+
+    Flow helpers have no storage ``id`` and no ``{type}/list`` command; the
+    component sources them from the config entry. The record carries the
+    ``entry_id`` (config-entry id), the current ``entity_id`` + display
+    ``name``, the ``helper_type``, and the data-minimized ``options`` body
+    (``ConfigEntry.options`` only, never ``entry.data``). Mirrors the
+    collection shaper's current-fields layering.
+    """
+    out: dict[str, Any] = {"helper_type": rec.get("helper_type")}
+    entry_id = rec.get("entry_id")
+    if entry_id is not None:
+        out["entry_id"] = entry_id
+    entity_id = rec.get("entity_id")
+    if entity_id is not None:
+        out["entity_id"] = entity_id
+    name = rec.get("name")
+    if name is not None:
+        out["name"] = name
+    options = rec.get("options")
+    if isinstance(options, dict):
+        out["options"] = options
+    return out
+
+
+def _shape_component_helpers_response(
+    helper_type: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    """Map an ``ha_mcp_tools/helpers_list`` result into the legacy envelope.
+
+    Emits the exact legacy top-level keys (``success``/``helper_type``/
+    ``count``/``helpers``/``message``). Records are shaped to the requested
+    universe: a flow ``helper_type`` yields flow records (``entry_id`` +
+    current ``entity_id``/``name`` + ``options``); a storage type yields the
+    storage-body records. A record of the other kind is dropped defensively.
+    ``count`` is the length of the emitted list, mirroring the legacy
+    ``count == len(helpers)`` guarantee.
+    """
+    raw = result.get("helpers")
+    records = raw if isinstance(raw, list) else []
+    want_flow = helper_type in FLOW_HELPER_TYPES
+    helpers: list[dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("kind") == "flow") != want_flow:
+            continue
+        helpers.append(
+            _shape_flow_helper_record(rec)
+            if want_flow
+            else _shape_collection_helper_record(rec)
+        )
+    return {
+        "success": True,
+        "helper_type": helper_type,
+        "count": len(helpers),
+        "helpers": helpers,
+        "message": f"Found {len(helpers)} {helper_type} helper(s)",
+    }
+
+
+def _component_covers(result: dict[str, Any], helper_type: str) -> bool:
+    """Whether a helpers_list response authoritatively enumerated ``helper_type``.
+
+    The component reports ``covered_types``: the helper types its response could
+    actually see. A type outside that list (e.g. ``tag`` — tags have no state
+    entity, so the component's from-states scan can't enumerate them) must NOT
+    be trusted as "none exist". A response with no ``covered_types`` at all (an
+    older component) is treated conservatively as covering nothing, so the
+    caller falls back rather than trusting a possibly-partial list.
+    """
+    covered = result.get("covered_types")
+    return isinstance(covered, list) and helper_type in covered
+
+
+def _raise_flow_requires_component(helper_type: str) -> NoReturn:
+    """Raise the structured error for a flow helper with no component path.
+
+    Flow-based helper types have no ``{type}/list`` WS command, so the legacy
+    listing path cannot enumerate them — only the ha_mcp_tools component's
+    ``helpers_list`` can. When the component is absent, downlevel, or its call
+    fails, this is a hard error: never a silent empty list, never a legacy
+    fallback (there is none for flow types).
+    """
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.COMPONENT_NOT_INSTALLED,
+            f"Listing '{helper_type}' (a flow-based helper) requires the "
+            "ha_mcp_tools custom component (>= 1.1.0); the built-in listing "
+            "path cannot enumerate flow helpers.",
+            context={"helper_type": helper_type},
+        )
+    )
+
+
+def _raise_all_requires_component() -> NoReturn:
+    """Raise the structured error for all-types listing with no component path.
+
+    ``helper_type="all"`` has no legacy equivalent — there is no single WS
+    command that enumerates every helper type — so, like a flow-based type, it
+    is served exclusively through the ha_mcp_tools component. When the component
+    is absent, downlevel, or its call fails, this is a hard error: never a
+    silent empty list, never a partial legacy fallback.
+    """
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.COMPONENT_NOT_INSTALLED,
+            "Listing all helper types in one call (helper_type='all') requires "
+            "the ha_mcp_tools custom component (>= 1.1.0); without it, list a "
+            "specific helper_type instead.",
+            context={"helper_type": "all"},
+        )
+    )
+
+
 class HelperConfigTools:
     """Encapsulates helper configuration tools for ha_config_list_helpers and ha_config_set_helper."""
 
@@ -3380,17 +3630,35 @@ class HelperConfigTools:
                 "zone",
                 "person",
                 "tag",
-            ],
-            Field(description="Type of helper entity to list"),
+                "all",
+            ]
+            | SUPPORTED_HELPERS,
+            Field(
+                description=(
+                    "Helper type to list. Storage types are listed on all "
+                    "installs; flow-based types require the ha_mcp_tools "
+                    "custom component. Pass 'all' to list every helper type in "
+                    "one call (also requires the ha_mcp_tools component)."
+                )
+            ),
         ],
     ) -> dict[str, Any]:
         """
         List all Home Assistant helpers of a specific type with their configurations.
 
         Returns complete configuration for all helpers of the specified type including:
-        - ID, name, icon
+        - id (immutable storage key), entity_id (current — address the helper by
+          this, where available), name (current display name), original_name
+          (creation-time name), icon
         - Type-specific settings (min/max for input_number, options for input_select, etc.)
         - Area and label assignments
+
+        For a helper renamed in the UI, id/original_name keep the storage values while
+        entity_id/name reflect the current entity registry (entity_id is the identifier
+        ha_config_set_helper resolves against, so prefer it over id for a renamed helper).
+        entity_id/original_name are present only for storage-collection helpers matched in
+        the entity registry — types with no backing entity (e.g. tag), and every record when
+        the registry read degrades, carry only id/name (a warning flags the degraded case).
 
         SUPPORTED HELPER TYPES:
         - input_button: Virtual buttons for triggering automations
@@ -3412,27 +3680,77 @@ class HelperConfigTools:
         - List all zones: ha_config_list_helpers("zone")
         - List all persons: ha_config_list_helpers("person")
         - List all tags: ha_config_list_helpers("tag")
+        - List every helper type at once: ha_config_list_helpers("all")
 
         **NOTE:** This only returns storage-based helpers (created via UI/API), not YAML-defined helpers.
 
         Flow-based types (template / group / utility_meter / derivative / etc.)
-        cannot be listed via this tool — use ``ha_search`` for those.
+        require the ha_mcp_tools custom component (>= 1.1.0) and are served only
+        through it; storage types are listed on all installs. Requesting a flow
+        type without the component returns a COMPONENT_NOT_INSTALLED error.
+
+        Pass helper_type="all" to enumerate every helper type in a single call.
+        Each record carries its own ``helper_type``. This mode is component-only
+        (there is no single built-in command that lists all types): without the
+        ha_mcp_tools component it returns a COMPONENT_NOT_INSTALLED error rather
+        than a partial or empty list.
 
         For detailed helper documentation, use ha_get_skill_guide.
         """
+        # All-types mode: one merged component listing across every helper type.
+        # No legacy equivalent exists (no single WS command enumerates all
+        # types), so it is component-only — see ``_list_all_helpers``.
+        if helper_type == "all":
+            return await self._list_all_helpers()
+
+        # Flow-based helper types have no ``{type}/list`` command, so only the
+        # component's ``helpers_list`` can enumerate them: they are served
+        # exclusively through the component path (never the legacy body, never a
+        # silent empty). Storage/collection types keep the legacy fallback.
+        is_flow = helper_type in FLOW_HELPER_TYPES
+
+        # Prefer the custom component's in-process listing when it advertises
+        # the capability: one WS round-trip that joins the entity registry, so
+        # each record carries the current entity_id + display name (the #1794
+        # stale-id fix, shipped additively) instead of only the storage id.
+        # Fall back cleanly for storage types when the component is absent,
+        # downlevel, or errors — the taxonomy lives in
+        # ``_list_helpers_via_component``. The legacy body below is untouched.
+        caps = await get_component_caps(self._client)
+        if component_supports(caps, "helpers_list"):
+            component_response = await self._list_helpers_via_component(
+                helper_type, is_flow=is_flow
+            )
+            if component_response is not None:
+                return component_response
+        if is_flow:
+            # No usable component path and the legacy body cannot serve flow
+            # helpers: hard error rather than an empty or misleading list.
+            _raise_flow_requires_component(helper_type)
         try:
             result = await self._client.send_websocket_message(
                 {"type": f"{helper_type}/list"}
             )
             if result.get("success"):
-                items = result.get("result", [])
-                return {
+                # Flatten first: person/list returns {"storage": [...],
+                # "config": [...]} rather than a flat list, so a raw
+                # result["result"] would be a dict here — breaking both the
+                # count and the registry enrichment below (which iterates
+                # records). _flatten_helper_list_result normalises both shapes.
+                items = _flatten_helper_list_result(result)
+                warnings = await _enrich_helpers_with_current_registry(
+                    self._client, helper_type, items
+                )
+                response: dict[str, Any] = {
                     "success": True,
                     "helper_type": helper_type,
                     "count": len(items),
                     "helpers": items,
                     "message": f"Found {len(items)} {helper_type} helper(s)",
                 }
+                if warnings:
+                    response["warnings"] = warnings
+                return response
             raise_tool_error(
                 create_error_response(
                     ErrorCode.SERVICE_CALL_FAILED,
@@ -3457,6 +3775,248 @@ class HelperConfigTools:
                 None  # exception_to_structured_error always raises; explicit for CodeQL
             )
         return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
+
+    async def _list_helpers_via_component(
+        self, helper_type: str, *, is_flow: bool
+    ) -> dict[str, Any] | None:
+        """Serve ha_config_list_helpers from the component; ``None`` ⇒ legacy.
+
+        Error taxonomy (component_api design § 4), with a flow-helper override
+        (a flow type has no legacy path, so any component failure is fatal):
+
+        - ``unknown_command`` (the cached positive caps went stale after a
+          component downgrade): invalidate the caps. For a storage type, return
+          ``None`` so the caller falls through to the byte-identical legacy
+          body, **silently**. For a flow type, raise the component-required
+          error.
+        - any other ``HomeAssistantCommandError`` (a component handler bug) or a
+          ``HomeAssistantCommandTimeout`` (the component WS list timed out):
+          for a storage type, serve the correct result from the legacy WS list,
+          append a ``warnings[]`` entry, and ``log.warning``. For a flow type,
+          raise the component-required error — no legacy fallback exists.
+        - ``HomeAssistantConnectionError`` (WS down): not caught here, so it
+          propagates; the legacy path depends on the same socket and would
+          fail identically.
+
+        On a successful response the type must also be in the component's
+        ``covered_types`` (see :func:`_component_covers`): a type the response
+        could not authoritatively enumerate (``tag``, or any type on an older
+        component with no ``covered_types``) is handled like a component miss —
+        storage falls back to legacy silently, flow raises.
+        """
+        try:
+            raw = await self._send_component_helpers_list(helper_type, is_flow=is_flow)
+        except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
+            unknown = is_unknown_command(exc)
+            if unknown:
+                invalidate_caps(self._client)
+            if is_flow:
+                logger.warning(
+                    "ha_mcp_tools/helpers_list failed for flow type %r: %r",
+                    helper_type,
+                    exc,
+                )
+                _raise_flow_requires_component(helper_type)
+            if unknown:
+                return None
+            legacy = await self._legacy_helper_list(helper_type)
+            legacy.setdefault("warnings", []).append(
+                f"component helpers_list path failed ({exc}); served via legacy path"
+            )
+            logger.warning(
+                "ha_mcp_tools/helpers_list failed; fell back to legacy: %r", exc
+            )
+            return legacy
+        result = raw.get("result") or {}
+        if not _component_covers(result, helper_type):
+            # The component did not authoritatively enumerate this type (tag has
+            # no state entity for the from-states scan; or an older component
+            # sent no covered_types). Don't trust a partial/empty list: storage
+            # types fall back to the legacy path silently; a flow type (always
+            # covered when include_flow_helpers=True) raises the same
+            # component-required error rather than emptying out.
+            if is_flow:
+                _raise_flow_requires_component(helper_type)
+            return None
+        return _shape_component_helpers_response(helper_type, result)
+
+    async def _send_component_helpers_list(
+        self, helper_type: str, *, is_flow: bool
+    ) -> dict[str, Any]:
+        """Send one ``ha_mcp_tools/helpers_list`` command over the per-client WS.
+
+        Requests only the single ``helper_type`` and sets
+        ``include_flow_helpers`` to match its universe — ``True`` for a
+        flow-based type (so the component returns its config-entry-backed
+        record), ``False`` for a storage/collection type.
+        """
+        ws = await get_websocket_client(
+            url=self._client.base_url, token=self._client.token
+        )
+        return await ws.send_command(
+            "ha_mcp_tools/helpers_list",
+            helper_types=[helper_type],
+            include_flow_helpers=is_flow,
+        )
+
+    async def _legacy_helper_list(self, helper_type: str) -> dict[str, Any]:
+        """Legacy ``{helper_type}/list`` success envelope, for the § 4 #3 fallback.
+
+        A faithful copy of the tool's inline legacy success path, kept separate
+        (rather than extracted from that body) so the #1794 registry-join PR can
+        patch the inline body without a conflict here. The drift is bounded to
+        the rare component-error fallback and is flagged by the ``warnings[]``
+        entry the caller appends.
+        """
+        result = await self._client.send_websocket_message(
+            {"type": f"{helper_type}/list"}
+        )
+        if not result.get("success"):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    f"Failed to list helpers: {result.get('error', 'Unknown error')}",
+                    context={"helper_type": helper_type},
+                )
+            )
+        items = result.get("result", [])
+        return {
+            "success": True,
+            "helper_type": helper_type,
+            "count": len(items),
+            "helpers": items,
+            "message": f"Found {len(items)} {helper_type} helper(s)",
+        }
+
+    async def _list_all_helpers(self) -> dict[str, Any]:
+        """Serve ``helper_type="all"``: one merged component listing, or a hard error.
+
+        All-types mode has no legacy equivalent, so it is component-only
+        (mirroring the flow-helper precedent). When the component advertises
+        ``helpers_list`` it serves the merged listing; otherwise — or if the
+        component call fails — this raises COMPONENT_NOT_INSTALLED via
+        :func:`_raise_all_requires_component` rather than returning an empty list.
+        A raw transport failure (e.g. the WS cannot connect right after an HA
+        restart) becomes the structured error the rest of the tool uses — never
+        an unclassified exception.
+        """
+        response: dict[str, Any] | None = None
+        try:
+            caps = await get_component_caps(self._client)
+            if component_supports(caps, "helpers_list"):
+                response = await self._all_helpers_via_component()
+        except ToolError:
+            raise
+        except Exception as e:
+            exception_to_structured_error(
+                e,
+                context={"helper_type": "all"},
+                suggestions=[
+                    "Home Assistant may be restarting or unreachable — retry shortly",
+                ],
+            )
+        if response is None:
+            _raise_all_requires_component()
+        return response
+
+    async def _all_helpers_via_component(self) -> dict[str, Any] | None:
+        """Serve all-types from the component; ``None`` ⇒ raise component-required.
+
+        There is no legacy all-types path, so — unlike single-type storage
+        listing — every component failure resolves to the same hard error the
+        caller raises (mirroring the flow-helper taxonomy). ``unknown_command``
+        additionally invalidates the now-stale positive caps.
+        """
+        try:
+            raw = await self._send_component_all_helpers()
+        except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
+            if is_unknown_command(exc):
+                invalidate_caps(self._client)
+            logger.warning("ha_mcp_tools/helpers_list (all) failed: %r", exc)
+            return None
+        return await self._shape_all_helpers_response(raw.get("result") or {})
+
+    async def _send_component_all_helpers(self) -> dict[str, Any]:
+        """Send one all-types ``ha_mcp_tools/helpers_list`` command (no type filter).
+
+        Omitting ``helper_types`` makes the component return every storage +
+        flow helper it can enumerate in a single round-trip
+        (``type_filter=None`` component-side).
+        """
+        ws = await get_websocket_client(
+            url=self._client.base_url,
+            token=self._client.token,
+            verify_ssl=getattr(self._client, "verify_ssl", None),
+        )
+        return await ws.send_command(
+            "ha_mcp_tools/helpers_list",
+            include_flow_helpers=True,
+        )
+
+    async def _shape_all_helpers_response(
+        self, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Map an all-types ``helpers_list`` result into the merged listing envelope.
+
+        Each record is shaped by kind (flow → ``_shape_flow_helper_record``,
+        collection → ``_shape_collection_helper_record``) and stamped with its
+        own ``helper_type`` so records of different types stay distinguishable in
+        the flat list. Respecting ``covered_types`` (mirroring the single-type
+        path): a simple type the component could not enumerate from the state
+        machine — ``tag`` has no state entity — is fetched per-type via its
+        legacy ``{type}/list`` and merged, so ``all`` never silently drops it.
+        """
+        raw = result.get("helpers")
+        records = raw if isinstance(raw, list) else []
+        helpers: list[dict[str, Any]] = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("kind") == "flow":
+                helpers.append(_shape_flow_helper_record(rec))
+            else:
+                shaped = _shape_collection_helper_record(rec)
+                # All-types records span many types, so each self-describes its
+                # type (single-type mode carries it at the envelope top instead).
+                shaped["helper_type"] = rec.get("helper_type")
+                helpers.append(shaped)
+
+        covered = result.get("covered_types")
+        covered_set = set(covered) if isinstance(covered, list) else set()
+        # Flow helper types have no legacy ``{type}/list`` fallback — if the
+        # component did not authoritatively cover one, a "successful" merged
+        # listing would silently omit it. Mirror the single-type taxonomy:
+        # hard error, never a partial inventory reported as complete.
+        uncovered_flow = sorted(FLOW_HELPER_TYPES - covered_set)
+        if uncovered_flow:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.COMPONENT_NOT_INSTALLED,
+                    "The ha_mcp_tools component response did not cover flow "
+                    f"helper type(s): {', '.join(uncovered_flow)} — cannot "
+                    "return a complete all-types listing.",
+                    context={"helper_type": "all", "uncovered": uncovered_flow},
+                    suggestions=[
+                        "Update the ha_mcp_tools custom component",
+                        "List helper types individually instead of 'all'",
+                    ],
+                )
+            )
+        for helper_type in sorted(SIMPLE_HELPER_TYPES - covered_set):
+            legacy = await self._legacy_helper_list(helper_type)
+            for item in legacy.get("helpers", []):
+                if isinstance(item, dict):
+                    row = dict(item)
+                    row.setdefault("helper_type", helper_type)
+                    helpers.append(row)
+
+        return {
+            "success": True,
+            "helper_type": "all",
+            "count": len(helpers),
+            "helpers": helpers,
+            "message": f"Found {len(helpers)} helper(s)",
+        }
 
     @tool(
         name="ha_config_set_helper",
@@ -3816,6 +4376,9 @@ class HelperConfigTools:
             bool,
             Field(default=True),
         ] = True,
+        # BestPracticeKey (#1779): consumed by StrictBpsMiddleware, never read
+        # here — see strict_bps.py for the declaration contract.
+        BestPracticeKey: BestPracticeKeyParam = None,
     ) -> dict[str, Any]:
         """
         Create or update Home Assistant helper entities and config subentries

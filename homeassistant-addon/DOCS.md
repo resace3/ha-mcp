@@ -537,7 +537,7 @@ The add-on provides 87+ MCP tools for controlling Home Assistant:
 ### Entity Registry
 - `ha_get_entity` — Get entity registry information for one or more entities.
 - `ha_get_entity_exposure` — Get entity exposure settings - list all or get settings for a specific entity.
-- `ha_remove_entity` — Remove an entity from the Home Assistant entity registry.
+- `ha_remove_entity` — Remove one or more entities from the Home Assistant entity registry.
 - `ha_set_entity` — Update entity properties in the entity registry.
 
 ### Files
@@ -568,7 +568,7 @@ The add-on provides 87+ MCP tools for controlling Home Assistant:
 ### Integrations
 - `ha_get_integration` — Get integration (config entry) information with pagination.
 - `ha_get_system_health` — Get Home Assistant system health, including Zigbee (ZHA), Z-Wave JS, and per-integration diagnostics dumps.
-- `ha_set_integration_enabled` — Enable/disable integration (config entry).
+- `ha_set_integration` — Manage an integration (config entry): enable/disable, add, or update options.
 
 ### Labels & Categories
 - `ha_config_get_category` — Get category info - list all categories for a scope or get a specific one by ID.

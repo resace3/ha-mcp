@@ -31,6 +31,29 @@ ALLOWLIST: set[str] = {
     # Advanced Settings or Feature Flags panels.
     "DISABLED_TOOLS",
     "PINNED_TOOLS",
+    # DAG Studio production settings are owned by the dedicated add-on's
+    # options/schema and injected by start.py.  The remaining DAG_STUDIO_*
+    # aliases configure the loopback-only development command (or its
+    # intentionally disabled optional AI adapter).  Surfacing them in the
+    # shared settings panel would either duplicate Supervisor-owned options
+    # or risk exposing an API key / enabling a remote development listener.
+    "ENABLE_DAG_STUDIO",
+    "DAG_STUDIO_MAX_REQUEST_BYTES",
+    "DAG_STUDIO_DATA_DIR",
+    "DAG_STUDIO_AI_PROVIDER",
+    "DAG_STUDIO_AI_BASE_URL",
+    "DAG_STUDIO_AI_MODEL",
+    "DAG_STUDIO_AI_API_KEY",
+    "DAG_STUDIO_AI_TIMEOUT_SECONDS",
+    "DAG_STUDIO_AI_MAX_RETRIES",
+    "DAG_STUDIO_AI_SEND_ENTITY_VALUES",
+    "DAG_STUDIO_AI_RATE_LIMIT_PER_MINUTE",
+    "DAG_STUDIO_HOST",
+    "DAG_STUDIO_PORT",
+    "DAG_STUDIO_BASE_PATH",
+    "DAG_STUDIO_OPEN_BROWSER",
+    "DAG_STUDIO_ALLOW_REMOTE",
+    "DAG_STUDIO_SESSION_TTL_MINUTES",
 }
 
 

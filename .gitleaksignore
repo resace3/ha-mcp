@@ -1,0 +1,3 @@
+# Synthetic API-key-shaped fixture inherited from upstream-derived commit 9a195f03.
+# This exact fingerprint is not a credential; keep all default Gitleaks rules active.
+9a195f03b4050e92f5f92cb5ec14e198f164ad95:tests/src/unit/test_component_search_contract.py:generic-api-key:138
