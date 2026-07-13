@@ -1,6 +1,6 @@
 name: "Home Assistant MCP Server - DAG Studio"
 description: "Private causal DAG tools for Home Assistant via MCP"
-version: "7.12.5"
+version: "7.12.6"
 slug: "ha_mcp_dag"
 url: "https://github.com/resace3/ha-mcp"
 arch:

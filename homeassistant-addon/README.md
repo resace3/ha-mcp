@@ -1,16 +1,21 @@
-# Home Assistant MCP Server Add-on
+# Home Assistant MCP Server - DAG Studio
 
-Control Home Assistant with AI assistants via Model Context Protocol.
+Build and review causal DAG hypotheses locally through a tightly scoped Model
+Context Protocol profile.
 
 ## About
 
-This add-on enables Claude, ChatGPT, and other AI assistants to control your Home Assistant installation. It provides 70+ tools for device control, automation management, entity search, calendars, todo lists, dashboards, and more.
+This fork exposes exactly ten DAG Studio tools. It does not register generic
+Home Assistant device, service, automation, or configuration write tools. Raw
+Home Assistant history is processed locally and is never returned as time-series
+rows to an MCP client.
 
 **Key Features:**
-- Zero configuration - auto-discovers Home Assistant connection
-- Secure by default - auto-generated secret paths
-- Fuzzy search - find entities even with typos
-- Backup & restore - safe configuration management
+- Authenticated, administrator-only Home Assistant ingress
+- Local, bounded history processing with sensitive domains denied by default
+- Revision-safe DAG storage, validation, snapshots, and deletion backups
+- Single-use confirmation tokens for approval and deletion
+- Server-side tool allowlisting and security policy enforcement
 
 ## Installation
 
@@ -19,5 +24,5 @@ See the [Documentation](DOCS.md) tab for complete installation and configuration
 ## Support
 
 - **Documentation**: [DOCS.md](DOCS.md)
-- **Issues**: https://github.com/homeassistant-ai/ha-mcp/issues
-- **Repository**: https://github.com/homeassistant-ai/ha-mcp
+- **Issues**: https://github.com/resace3/ha-mcp/issues
+- **Repository**: https://github.com/resace3/ha-mcp
