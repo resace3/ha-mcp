@@ -38,7 +38,6 @@ class AuditLogger:
             handle.write(json.dumps(event, separators=(",", ":")) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        try:
-            os.chmod(self.path, 0o600)
-        except OSError:
-            pass
+        # Fail closed: an audit record is not considered complete unless its
+        # file is restricted to the add-on process owner.
+        os.chmod(self.path, 0o600)

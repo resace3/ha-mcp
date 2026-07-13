@@ -176,6 +176,6 @@ def main() -> None:
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\nDAG Studio stopped.", flush=True)
     finally:
         httpd.server_close()
