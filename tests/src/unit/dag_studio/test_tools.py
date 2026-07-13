@@ -49,9 +49,7 @@ async def test_dedicated_profile_lists_exactly_ten_tools(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_documents_caps_output_at_schema_limit(
-    tmp_path: Path, monkeypatch
-):
+async def test_list_documents_caps_output_at_schema_limit(tmp_path: Path, monkeypatch):
     service = DagStudioService(JsonDagRepository(tmp_path / "store"))
     documents = [
         DagDocument(id=f"bounded-{index}", title=f"Document {index}", revision=1)
