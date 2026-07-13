@@ -37,9 +37,9 @@ jobs:
           file: homeassistant-addon/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ghcr.io/resace3/ha-mcp-dag-addon-${{ matrix.arch }}:7.12.4
+          tags: ghcr.io/resace3/ha-mcp-dag-addon-${{ matrix.arch }}:7.12.5
           build-args: |
-            BUILD_VERSION=7.12.4
+            BUILD_VERSION=7.12.5
             BUILD_ARCH=${{ matrix.arch }}
             BUILD_COMMIT=${{ github.sha }}
           provenance: mode=max
@@ -63,18 +63,18 @@ jobs:
       - name: Publish multi-architecture OCI manifest
         run: |
           docker buildx imagetools create \
-            --tag ghcr.io/resace3/ha-mcp-dag-addon:7.12.4 \
-            ghcr.io/resace3/ha-mcp-dag-addon-amd64:7.12.4 \
-            ghcr.io/resace3/ha-mcp-dag-addon-aarch64:7.12.4
+            --tag ghcr.io/resace3/ha-mcp-dag-addon:7.12.5 \
+            ghcr.io/resace3/ha-mcp-dag-addon-amd64:7.12.5 \
+            ghcr.io/resace3/ha-mcp-dag-addon-aarch64:7.12.5
           docker buildx imagetools inspect \
-            ghcr.io/resace3/ha-mcp-dag-addon:7.12.4 \
+            ghcr.io/resace3/ha-mcp-dag-addon:7.12.5 \
             --format '{{json .Manifest}}' > manifest.json
       - name: Record immutable manifest digest
         id: manifest
         shell: bash
         run: |
           digest="$(docker buildx imagetools inspect \
-            ghcr.io/resace3/ha-mcp-dag-addon:7.12.4 \
+            ghcr.io/resace3/ha-mcp-dag-addon:7.12.5 \
             --format '{{json .Manifest.Digest}}' | tr -d '"')"
           test -n "$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -110,7 +110,7 @@ jobs:
         env:
           TRIVY_PLATFORM: ${{ matrix.platform }}
         with:
-          image-ref: ghcr.io/resace3/ha-mcp-dag-addon-${{ matrix.arch }}:7.12.4
+          image-ref: ghcr.io/resace3/ha-mcp-dag-addon-${{ matrix.arch }}:7.12.5
           format: table
           exit-code: "1"
           ignore-unfixed: false

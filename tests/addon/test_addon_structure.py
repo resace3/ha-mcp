@@ -274,6 +274,10 @@ class TestAddonStructure:
         assert "HA_MCP_BUILD_COMMIT" in start_src
         assert "ghcr.io/resace3/ha-mcp-dag-addon" in start_src
         assert "ARG BUILD_COMMIT" in dockerfile
+        assert "python3.13-alpine@sha256:" in dockerfile
+        assert "python:3.13-alpine@sha256:" in dockerfile
+        assert "trixie-slim" not in dockerfile
+        assert "python:3.13-slim" not in dockerfile
         assert (
             'org.opencontainers.image.source="https://github.com/resace3/ha-mcp"'
             in dockerfile

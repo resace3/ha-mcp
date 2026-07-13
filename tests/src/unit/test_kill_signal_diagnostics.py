@@ -275,14 +275,25 @@ class TestInstallKillSignalDiagnostics:
         with patch.object(sys, "platform", "darwin"):
             assert install_kill_signal_diagnostics() is False
 
-    def test_returns_false_when_libc_lookup_fails(self) -> None:
+    def test_falls_back_to_process_symbols_when_libc_lookup_fails(self) -> None:
         if sys.platform != "linux":
             pytest.skip("Linux-only branch")
-        with patch(
-            "ha_mcp.utils.kill_signal_diagnostics.ctypes.util.find_library",
-            return_value=None,
+        fake_libc = MagicMock()
+        fake_libc.sigaction.return_value = 0
+        with (
+            patch(
+                "ha_mcp.utils.kill_signal_diagnostics.ctypes.util.find_library",
+                return_value=None,
+            ),
+            patch(
+                "ha_mcp.utils.kill_signal_diagnostics.ctypes.CDLL",
+                return_value=fake_libc,
+            ) as mock_cdll,
         ):
-            assert install_kill_signal_diagnostics() is False
+            assert install_kill_signal_diagnostics() is True
+
+        mock_cdll.assert_called_once_with(None, use_errno=True)
+        assert fake_libc.sigaction.call_count == 3
 
     def test_install_never_raises_on_libc_load_error(self) -> None:
         # Diagnostics must not block addon startup. If libc loading or
