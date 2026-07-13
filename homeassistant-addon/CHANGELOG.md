@@ -3,6 +3,14 @@
 <!-- version list -->
 
 
+## v7.12.5 (2026-07-13)
+
+### Security
+
+- Move the builder and runtime to matching digest-pinned Alpine images that
+  scan with zero high or critical findings on amd64 and arm64.
+
+
 ## v7.12.4 (2026-07-13)
 
 ### Added

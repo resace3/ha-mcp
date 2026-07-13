@@ -5,7 +5,7 @@
 # No bashio needed - pure Python startup script
 
 # --- Build stage: install dependencies with uv ---
-FROM ghcr.io/astral-sh/uv:0.11.27-python3.13-trixie-slim@sha256:68bbb9d4281aa16c9780820ceaf4c558d78fb65ce45d42eb589d7234e3f26e15 AS builder
+FROM ghcr.io/astral-sh/uv:0.11.27-python3.13-alpine@sha256:633713817551348828c0feba52e2c9295ce2af7e9bc82bcc84b40cd9ab4d2194 AS builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
 # --- Runtime stage: clean image without uv ---
-FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7ecc23d0755e35f
+FROM python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
 
 WORKDIR /app
 
