@@ -1,0 +1,10 @@
+name: Activate Actions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GitHub Actions activated"
