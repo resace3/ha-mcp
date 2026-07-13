@@ -298,6 +298,16 @@ class TestAddonStructure:
         assert "network inet stream" in profile
         assert "network raw" not in profile
 
+    def test_dag_addon_readme_describes_only_the_scoped_profile(self):
+        readme = (_REPO_ROOT / ADDON_DIR / "README.md").read_text(encoding="utf-8")
+
+        assert "exactly ten DAG Studio tools" in readme
+        assert "does not register generic" in readme
+        assert "70+ tools" not in readme
+        assert "device control" not in readme
+        assert "https://github.com/resace3/ha-mcp" in readme
+        assert "https://github.com/homeassistant-ai/ha-mcp" not in readme
+
     @pytest.mark.skipif(
         sys.platform == "win32", reason="Unix permissions not applicable on Windows"
     )

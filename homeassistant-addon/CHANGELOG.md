@@ -3,6 +3,14 @@
 <!-- version list -->
 
 
+## v7.12.6 (2026-07-13)
+
+### Security
+
+- Correct the add-on description and support links so the installed DAG profile
+  no longer claims to expose generic Home Assistant control tools.
+
+
 ## v7.12.5 (2026-07-13)
 
 ### Security
