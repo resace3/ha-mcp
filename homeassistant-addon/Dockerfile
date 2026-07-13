@@ -39,13 +39,17 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Docker pulls that don't pass it fall through to package metadata.
 ARG BUILD_VERSION
 ARG BUILD_ARCH
-ENV HA_MCP_BUILD_VERSION=${BUILD_VERSION}
+ARG BUILD_COMMIT
+ENV HA_MCP_BUILD_VERSION=${BUILD_VERSION} \
+    HA_MCP_BUILD_COMMIT=${BUILD_COMMIT}
 
 LABEL \
-    io.hass.name="Home Assistant MCP Server" \
-    io.hass.description="AI assistant integration via Model Context Protocol" \
+    io.hass.name="Home Assistant MCP Server - DAG Studio" \
+    io.hass.description="Private causal DAG tools for Home Assistant via MCP" \
     io.hass.version="${BUILD_VERSION}" \
     io.hass.type="addon" \
-    io.hass.arch="${BUILD_ARCH}"
+    io.hass.arch="${BUILD_ARCH}" \
+    org.opencontainers.image.source="https://github.com/resace3/ha-mcp" \
+    org.opencontainers.image.revision="${BUILD_COMMIT}"
 
 CMD ["python3", "/start.py"]

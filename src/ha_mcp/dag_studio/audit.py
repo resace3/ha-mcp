@@ -24,6 +24,7 @@ class AuditLogger:
         result: str,
         correlation_id: str,
         actor: str = "mcp-client",
+        session_id: str | None = None,
     ) -> None:
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -33,6 +34,7 @@ class AuditLogger:
             "revision": revision,
             "result": result,
             "correlation_id": correlation_id,
+            "session_id": session_id[:100] if session_id else None,
         }
         with self._lock, self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, separators=(",", ":")) + "\n")

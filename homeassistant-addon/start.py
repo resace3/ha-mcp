@@ -390,7 +390,10 @@ def main() -> int:
     disabled_tools_raw = ""  # default
     pinned_tools_raw = ""  # default
     verify_ssl = True  # default
-    enable_dag_studio = True  # forked DAG add-on default
+    # Opt-in only: the distinct fork add-on schema enables this, while the
+    # shared dev add-on (which also executes this start.py) keeps the normal
+    # HA-MCP tool catalog for regression testing and development.
+    enable_dag_studio = False
     dag_studio_max_request_bytes = 1_048_576
 
     if config_file.exists():
@@ -541,7 +544,7 @@ def main() -> int:
             raw_pinned = config.get("pinned_tools", "")
             pinned_tools_raw = raw_pinned if isinstance(raw_pinned, str) else ""
             verify_ssl = resolve_bool_option(config, "verify_ssl", True)
-            enable_dag_studio = resolve_bool_option(config, "enable_dag_studio", True)
+            enable_dag_studio = resolve_bool_option(config, "enable_dag_studio", False)
             raw_dag_max = config.get("dag_studio_max_request_bytes", 1_048_576)
             dag_studio_max_request_bytes = (
                 raw_dag_max if isinstance(raw_dag_max, int) else 1_048_576
@@ -593,8 +596,12 @@ def main() -> int:
     os.environ["DAG_STUDIO_DATA_DIR"] = "/data/dag_studio"
     os.environ["DAG_STUDIO_AI_PROVIDER"] = "disabled"
     os.environ["DAG_STUDIO_MAX_REQUEST_BYTES"] = str(dag_studio_max_request_bytes)
-    # Dedicated DAG profile: no generic device, service, automation or config tools.
-    os.environ["ENABLED_TOOL_MODULES"] = "tools_dag"
+    # Dedicated DAG profile: no generic device, service, automation or config
+    # tools. Do not set this for the shared dev add-on profile.
+    if enable_dag_studio:
+        os.environ["ENABLED_TOOL_MODULES"] = "tools_dag"
+    else:
+        os.environ.pop("ENABLED_TOOL_MODULES", None)
     # ENABLE_MANDATORY_BPS is non-beta and default-ON, so it is written
     # unconditionally (like the stable core settings above) — never
     # presence-gated or beta-master-gated like the beta sub-flags below.
@@ -735,12 +742,20 @@ def main() -> int:
 
     log_info("")
     log_info("=" * 80)
-    log_info(f"🔐 MCP Server URL: http://<home-assistant-ip>:9583{secret_path}")
-    log_info("")
-    log_info(f"   Secret Path: {secret_path}")
-    log_info("")
-    log_info("   ⚠️  IMPORTANT: Copy this exact URL - the secret path is required!")
-    log_info("   💡 This path is auto-generated and persisted to /data/secret_path.txt")
+    if enable_dag_studio:
+        # The dedicated fork treats the secret path as a bearer credential.
+        # It is persisted for the process but never copied into add-on logs.
+        log_info("MCP Server URL: http://<home-assistant-ip>:9583/<redacted>")
+        log_info("Secret path is configured and redacted from logs")
+    else:
+        log_info(f"🔐 MCP Server URL: http://<home-assistant-ip>:9583{secret_path}")
+        log_info("")
+        log_info(f"   Secret Path: {secret_path}")
+        log_info("")
+        log_info("   ⚠️  IMPORTANT: Copy this exact URL - the secret path is required!")
+        log_info(
+            "   💡 This path is auto-generated and persisted to /data/secret_path.txt"
+        )
     log_info("=" * 80)
     log_info("")
 
@@ -769,6 +784,13 @@ def main() -> int:
     # addon logs — only FastMCP's own banner does (via run_async). Mirrors how
     # FastMCP surfaces its update notice in these same startup logs.
     _log_startup_version()
+    if enable_dag_studio:
+        build_commit = os.getenv("HA_MCP_BUILD_COMMIT", "unknown")
+        log_info("Home Assistant MCP Server - DAG Studio (fork: resace3/ha-mcp)")
+        log_info(f"Fork commit: {build_commit[:12]}")
+        log_info("Container source: ghcr.io/resace3/ha-mcp-dag-addon")
+        log_info("Dedicated DAG profile: exactly 10 DAG tools; generic tools disabled")
+        log_info("DAG Studio route: authenticated Supervisor ingress only")
 
     # Re-apply the effective log level now that ha_mcp is imported —
     # the basicConfig above could only hardcode INFO. Without this, the

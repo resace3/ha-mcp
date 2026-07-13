@@ -30,6 +30,7 @@ class TestAddonStructure:
             "start.py",
             "README.md",
             "DOCS.md",
+            "apparmor.txt",
         ]
         for file in required_files:
             path = os.path.join(ADDON_DIR, file)
@@ -56,14 +57,15 @@ class TestAddonStructure:
         assert config["hassio_api"] is True, "hassio_api required for Supervisor"
         assert config["homeassistant_api"] is True, "homeassistant_api required"
 
-        # Verify image field uses per-architecture naming
+        # The DAG fork publishes and consumes one multi-architecture OCI
+        # manifest. The upstream add-on retains its compatibility placeholder.
         expected_image = (
-            "ghcr.io/resace3/ha-mcp-dag-addon-{arch}"
+            "ghcr.io/resace3/ha-mcp-dag-addon"
             if config.get("slug") == "ha_mcp_dag"
             else "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}"
         )
         assert config["image"] == expected_image, (
-            "image field must use the repository-owned per-architecture name"
+            "image field must use the expected repository-owned image"
         )
 
         # Verify port configuration (fixed internal port)
@@ -243,6 +245,49 @@ class TestAddonStructure:
             f"{m.group(1)!r}, but start.py exports "
             'os.environ["ENABLE_STRICT_MANDATORY_BPS"] — they must match'
         )
+
+    def test_dag_profile_is_opt_in_and_excludes_generic_tools(self):
+        """The shared dev add-on must keep its normal tools, while the distinct
+        DAG add-on opts into the tightly scoped tool module from config.yaml.
+        """
+        start_src = (_REPO_ROOT / ADDON_DIR / "start.py").read_text(encoding="utf-8")
+        stable = yaml.safe_load((_REPO_ROOT / ADDON_DIR / "config.yaml").read_text())
+        dev = yaml.safe_load(
+            (_REPO_ROOT / "homeassistant-addon-dev" / "config.yaml").read_text()
+        )
+
+        assert stable["options"]["enable_dag_studio"] is True
+        assert "enable_dag_studio" not in dev["options"]
+        assert "enable_dag_studio = False" in start_src
+        assert "if enable_dag_studio:" in start_src
+        assert 'os.environ["ENABLED_TOOL_MODULES"] = "tools_dag"' in start_src
+        assert 'os.environ.pop("ENABLED_TOOL_MODULES", None)' in start_src
+
+    def test_dag_build_identity_and_secret_redaction_are_wired(self):
+        start_src = (_REPO_ROOT / ADDON_DIR / "start.py").read_text(encoding="utf-8")
+        dockerfile = (_REPO_ROOT / ADDON_DIR / "Dockerfile").read_text(encoding="utf-8")
+        workflow = (_REPO_ROOT / ".github/workflows/publish-dag-addon.yml").read_text(
+            encoding="utf-8"
+        )
+
+        assert "Secret path is configured and redacted from logs" in start_src
+        assert "HA_MCP_BUILD_COMMIT" in start_src
+        assert "ghcr.io/resace3/ha-mcp-dag-addon" in start_src
+        assert "ARG BUILD_COMMIT" in dockerfile
+        assert (
+            'org.opencontainers.image.source="https://github.com/resace3/ha-mcp"'
+            in dockerfile
+        )
+        assert "BUILD_COMMIT=${{ github.sha }}" in workflow
+
+        config = yaml.safe_load(
+            (_REPO_ROOT / ADDON_DIR / "config.yaml").read_text(encoding="utf-8")
+        )
+        profile = (_REPO_ROOT / ADDON_DIR / "apparmor.txt").read_text(encoding="utf-8")
+        assert config["apparmor"] is True
+        assert "profile ha_mcp_dag" in profile
+        assert "network inet stream" in profile
+        assert "network raw" not in profile
 
     @pytest.mark.skipif(
         sys.platform == "win32", reason="Unix permissions not applicable on Windows"

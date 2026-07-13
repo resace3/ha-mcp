@@ -39,6 +39,21 @@ class DagStudioService:
     def validate(self, doc: DagDocument) -> Sequence[Finding]:
         return validate_dag(doc)
 
+    def revisions(self, id: str) -> Sequence[int]:  # noqa: A002
+        self.get(id)
+        return self.repository.list_revisions(id)
+
+    def restore(self, id: str, revision: int, expected_revision: int) -> DagDocument:  # noqa: A002
+        self._write()
+        current = self.get(id)
+        if current.revision != expected_revision:
+            from .repository import RevisionConflict
+
+            raise RevisionConflict(
+                f"expected {expected_revision}, current {current.revision}"
+            )
+        return self.repository.restore_revision(id, revision)
+
     def approve(self, id: str, revision: int, approved_by: str) -> DagDocument:  # noqa: A002
         self._write()
         doc = self.get(id)

@@ -20,6 +20,7 @@ class JsonDagRepository:
         self._lock = threading.RLock()
         for p in (root, self.history, self.backups):
             p.mkdir(parents=True, exist_ok=True)
+            os.chmod(p, 0o700)
 
     def _path(self, id: str) -> Path:  # noqa: A002
         if "/" in id or "\\" in id or ".." in id:
@@ -82,15 +83,23 @@ class JsonDagRepository:
     def _snapshot(self, doc: DagDocument, base: Path | None = None) -> None:
         d = (base or self.history) / doc.id
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{doc.revision}.json").write_text(doc.model_dump_json(indent=2), "utf-8")
+        os.chmod(d, 0o700)
+        self._atomic_write(d / f"{doc.revision}.json", doc.model_dump_json(indent=2))
 
     def _write(self, doc: DagDocument) -> None:
-        target = self._path(doc.id)
-        tmp = target.with_suffix(".tmp")
-        data = doc.model_dump_json(indent=2)
-        with tmp.open("w", encoding="utf-8") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, target)
+        self._atomic_write(self._path(doc.id), doc.model_dump_json(indent=2))
+
+    @staticmethod
+    def _atomic_write(target: Path, data: str) -> None:
+        tmp = target.with_name(
+            f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with tmp.open("x", encoding="utf-8") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)

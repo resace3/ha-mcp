@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def utcnow() -> datetime:
@@ -24,11 +24,15 @@ class Role(StrEnum):
 
 
 class Position(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     x: float = Field(ge=-100000, le=100000)
     y: float = Field(ge=-100000, le=100000)
 
 
 class DagNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
     label: str = Field(min_length=1, max_length=200)
     description: str | None = Field(None, max_length=4000)
@@ -46,6 +50,8 @@ class DagNode(BaseModel):
 
 
 class DagEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
     source_node_id: str
     target_node_id: str
@@ -67,6 +73,8 @@ class DagEdge(BaseModel):
 
 
 class DagDocument(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     schema_version: int = Field(1, ge=1, le=1)
     id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
     title: str = Field(min_length=1, max_length=200)
@@ -75,8 +83,8 @@ class DagDocument(BaseModel):
     exposure_node_id: str | None = None
     outcome_node_id: str | None = None
     adjustment_node_ids: list[str] = Field(default_factory=list)
-    nodes: list[DagNode] = Field(default_factory=list, max_length=500)
-    edges: list[DagEdge] = Field(default_factory=list, max_length=2000)
+    nodes: list[DagNode] = Field(default_factory=list, max_length=100)
+    edges: list[DagEdge] = Field(default_factory=list, max_length=500)
     revision: int = Field(0, ge=0)
     status: str = Field(
         "draft",

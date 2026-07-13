@@ -23,6 +23,7 @@ ingress: true
 ingress_port: 9583
 ingress_stream: true
 panel_admin: true
+apparmor: true
 # Enable access to Supervisor API for auto-discovery
 hassio_api: true
 # `manager` (not `default`) is required so the Supervisor token grants access
@@ -34,7 +35,7 @@ homeassistant_api: true
 # Enable host network mode for local network access
 host_network: true
 # Use pre-built Docker images
-image: "ghcr.io/resace3/ha-mcp-dag-addon-{arch}"
+image: "ghcr.io/resace3/ha-mcp-dag-addon"
 # Options for user configuration
 # NOTE: enable_yaml_config_editing (+ enable_yaml_packages_* and
 # enable_yaml_edit_confirm),
