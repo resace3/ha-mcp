@@ -389,9 +389,10 @@ def install_kill_signal_diagnostics() -> bool:
     can chain to it. Idempotent — second call is a no-op.
 
     Returns True if at least one signal was installed; False on
-    non-Linux, missing libc, or if every sigaction call failed. Never
-    raises: callers don't need to wrap in try/except. This contract is
-    load-bearing — diagnostics must not block addon startup.
+    non-Linux, an unusable libc, or if every sigaction call failed.
+    Never raises: callers don't need to wrap in try/except. This
+    contract is load-bearing — diagnostics must not block addon
+    startup.
     """
     global _libc
 
@@ -410,12 +411,11 @@ def install_kill_signal_diagnostics() -> bool:
 
     try:
         libc_path = ctypes.util.find_library("c")
-        if libc_path is None:
-            logger.warning(
-                "kill-signal diagnostics: libc not found; skipping signal handler install"
-            )
-            return False
-
+        # musl-based distributions (including Alpine) can return None
+        # here even though libc's symbols are already exported by the
+        # running process. CDLL(None) is ctypes' supported way to load
+        # that global symbol table and also works as a safe fallback on
+        # glibc systems where the lookup unexpectedly fails.
         libc = ctypes.CDLL(libc_path, use_errno=True)
         libc.sigaction.restype = ctypes.c_int
         libc.sigaction.argtypes = [
