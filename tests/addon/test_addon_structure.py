@@ -279,10 +279,15 @@ class TestAddonStructure:
             in dockerfile
         )
         assert "BUILD_COMMIT=${{ github.sha }}" in workflow
+        assert "TRIVY_PLATFORM: ${{ matrix.platform }}" in workflow
+        assert "platform: linux/amd64" in workflow
+        assert "platform: linux/arm64" in workflow
+        assert "fail-fast: false" in workflow
 
         config = yaml.safe_load(
             (_REPO_ROOT / ADDON_DIR / "config.yaml").read_text(encoding="utf-8")
         )
+        assert f":{config['version']}" in workflow
         profile = (_REPO_ROOT / ADDON_DIR / "apparmor.txt").read_text(encoding="utf-8")
         assert config["apparmor"] is True
         assert "profile ha_mcp_dag" in profile
