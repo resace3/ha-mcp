@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from ha_mcp.dag_studio.models import DagDocument, DagEdge, DagNode
 from ha_mcp.dag_studio.repository import JsonDagRepository, RevisionConflict
+from ha_mcp.dag_studio.service import DagStudioService
 from ha_mcp.dag_studio.validation import validate_dag
 
 
@@ -47,3 +48,9 @@ def test_repository_revisions(tmp_path: Path):
     assert d.revision == 2 and r.list_revisions("x") == [1]
     with pytest.raises(RevisionConflict):
         r.update_document(d, 1)
+
+
+def test_read_only_service_blocks_writes(tmp_path: Path):
+    service = DagStudioService(JsonDagRepository(tmp_path), read_only=True)
+    with pytest.raises(PermissionError, match="READ_ONLY_MODE"):
+        service.create(DagDocument(id="x", title="x"))

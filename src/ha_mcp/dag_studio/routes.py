@@ -36,7 +36,7 @@ def _service() -> DagStudioService:
         if settings.dag_studio_data_dir
         else get_data_dir() / "dag_studio"
     )
-    return DagStudioService(JsonDagRepository(root), read_only=False)
+    return DagStudioService(JsonDagRepository(root), read_only=settings.read_only_mode)
 
 
 def _response(data: Any, status: int = 200) -> JSONResponse:
@@ -101,6 +101,8 @@ async def _documents(request: Request) -> Response:
         )
     except RevisionConflict as exc:
         return _error("DAG_REVISION_CONFLICT", str(exc), 409)
+    except PermissionError:
+        return _error("READ_ONLY_MODE", "Writes are disabled in read-only mode", 403)
     except (ValueError, TypeError) as exc:
         return _error("DAG_INVALID", str(exc), 422)
 

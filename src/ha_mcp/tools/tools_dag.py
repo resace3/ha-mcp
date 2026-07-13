@@ -42,7 +42,7 @@ def _service() -> tuple[DagStudioService, AuditLogger]:
         else get_data_dir() / "dag_studio"
     )
     return (
-        DagStudioService(JsonDagRepository(root), read_only=False),
+        DagStudioService(JsonDagRepository(root), read_only=settings.read_only_mode),
         AuditLogger(root / "audit.jsonl"),
     )
 
