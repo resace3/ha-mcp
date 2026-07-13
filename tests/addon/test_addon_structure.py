@@ -57,8 +57,13 @@ class TestAddonStructure:
         assert config["homeassistant_api"] is True, "homeassistant_api required"
 
         # Verify image field uses per-architecture naming
-        assert config["image"] == "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}", (
-            "image field must use per-architecture naming with {arch} placeholder"
+        expected_image = (
+            "ghcr.io/resace3/ha-mcp-dag-addon-{arch}"
+            if config.get("slug") == "ha_mcp_dag"
+            else "ghcr.io/homeassistant-ai/ha-mcp-addon-{arch}"
+        )
+        assert config["image"] == expected_image, (
+            "image field must use the repository-owned per-architecture name"
         )
 
         # Verify port configuration (fixed internal port)

@@ -390,6 +390,8 @@ def main() -> int:
     disabled_tools_raw = ""  # default
     pinned_tools_raw = ""  # default
     verify_ssl = True  # default
+    enable_dag_studio = True  # forked DAG add-on default
+    dag_studio_max_request_bytes = 1_048_576
 
     if config_file.exists():
         try:
@@ -539,6 +541,11 @@ def main() -> int:
             raw_pinned = config.get("pinned_tools", "")
             pinned_tools_raw = raw_pinned if isinstance(raw_pinned, str) else ""
             verify_ssl = resolve_bool_option(config, "verify_ssl", True)
+            enable_dag_studio = resolve_bool_option(config, "enable_dag_studio", True)
+            raw_dag_max = config.get("dag_studio_max_request_bytes", 1_048_576)
+            dag_studio_max_request_bytes = (
+                raw_dag_max if isinstance(raw_dag_max, int) else 1_048_576
+            )
         except Exception as e:
             log_error(f"Failed to read config: {e}, using defaults")
             # Persistent "you lost your features" line so an operator
@@ -582,6 +589,12 @@ def main() -> int:
     # READ_ONLY_MODE is non-beta and in BOTH addon schemas, so it is
     # written unconditionally (like ENABLE_MANDATORY_BPS below).
     os.environ["READ_ONLY_MODE"] = str(read_only_mode).lower()
+    os.environ["ENABLE_DAG_STUDIO"] = str(enable_dag_studio).lower()
+    os.environ["DAG_STUDIO_DATA_DIR"] = "/data/dag_studio"
+    os.environ["DAG_STUDIO_AI_PROVIDER"] = "disabled"
+    os.environ["DAG_STUDIO_MAX_REQUEST_BYTES"] = str(dag_studio_max_request_bytes)
+    # Dedicated DAG profile: no generic device, service, automation or config tools.
+    os.environ["ENABLED_TOOL_MODULES"] = "tools_dag"
     # ENABLE_MANDATORY_BPS is non-beta and default-ON, so it is written
     # unconditionally (like the stable core settings above) — never
     # presence-gated or beta-master-gated like the beta sub-flags below.
@@ -796,6 +809,11 @@ def main() -> int:
     register_settings_routes(
         server_instance.mcp, server_instance, secret_path=secret_path
     )
+    # DAG Studio is deliberately ingress-only: do not mount it under the
+    # public secret MCP path used by the webhook proxy.
+    from ha_mcp.dag_studio.routes import register_dag_studio_routes
+
+    register_dag_studio_routes(server_instance.mcp)
     logging.getLogger("mcp.server.streamable_http").addFilter(
         StatelessSessionLogFilter()
     )

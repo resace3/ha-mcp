@@ -132,3 +132,14 @@ configuration:
       Tools tab and cannot be unpinned from the web Settings UI without
       unsetting this option first. Useful in combination with Tool Search.
       Comma-separated tool names.
+  enable_dag_studio:
+    name: Enable Local DAG Studio
+    description: >-
+      Enables the authenticated ingress DAG editor and the dedicated DAG-only
+      MCP tool surface. Raw Home Assistant history is processed locally and is
+      never returned through MCP. Requires restart.
+  dag_studio_max_request_bytes:
+    name: DAG Studio request limit (bytes)
+    description: >-
+      Maximum accepted DAG Studio JSON request size. Default 1048576 bytes;
+      allowed range 1024 through 10485760. Requires restart.
